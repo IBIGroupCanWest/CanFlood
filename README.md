@@ -33,6 +33,9 @@ Happy flood risk modelling!
 
 7) We recommend implementing the QGIS DEBUG logger for more detailed readouts and CanFlood model debugging. See [this post](https://stackoverflow.com/a/61669864/9871683) for insturctions.
 
+### tl;dr
+download the latest zip from [here](https://github.com/IBIGroupCanWest/CanFlood/tree/master/plugin_zips) and install in Qgis (Plugins > Manage and Install... > Install from Zip)
+
 ### Troubleshooting Installation
 
 As both QGIS and CanFlood are active open source projects, getting your installation configured can be challenging, especially if you lack admin privileges to your machine and have no pyqgis experience. Some installations of QGIS may not come pre-installed with all the required python packages and dependencies listed in the [requirements](https://github.com/IBIGroupCanWest/CanFlood/tree/master/requirements) file.  If you get a ModuleNotFound error, your Qgis install does not have the required packages. This can be easily remedied by a user with admin privileges and working pyqgis knowledge.  The following [solution](https://github.com/IBIGroupCanWest/CanFlood/issues/6#issuecomment-592091488) provides some guidance on installing third party python modules, but you'll likely need admin privilege. 
