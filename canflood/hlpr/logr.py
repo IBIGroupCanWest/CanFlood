@@ -15,13 +15,10 @@ class Error(Exception):
 
         mod_logger.error(msg)
 
-def basic_logger(): #for standalone loggers
-    """
-    should create 2 logger's in the users home directory:
-
+def basic_logger(): #for logging outside the plugin
     
-    """
-
+    
+    
     base_dir = os.path.dirname(os.path.dirname(__file__)) #canflood
     logcfg_file = os.path.join(base_dir, '_pars', 'logger.conf')
     
