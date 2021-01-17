@@ -12,22 +12,31 @@ impacts model 2
 # imports---------------------------
 #==============================================================================
 #python standards
-import configparser, os, logging, datetime
+import configparser, os, logging
 
 import pandas as pd
 import numpy as np
-#import math
-idx = pd.IndexSlice
+import math
+
 #==============================================================================
 # custom imports
 #==============================================================================
 
-mod_logger = logging.getLogger('dmg2') #get the root logger
+#standalone runs
+if __name__ =="__main__": 
+    from hlpr.logr import basic_logger
+    mod_logger = basic_logger()   
+    
+    from hlpr.exceptions import Error
+    
+#plugin runs
+else:
+    mod_logger = logging.getLogger('dmg2') #get the root logger
 
-from hlpr.exceptions import QError as Error
+    from hlpr.exceptions import QError as Error
 
-#from hlpr.Q import *
-from hlpr.basic import ComWrkr, view
+from hlpr.Q import *
+from hlpr.basic import *
 from model.modcom import Model
 
 
@@ -39,23 +48,10 @@ class Dmg2(Model):
     # #program vars
     #==========================================================================
     valid_par = 'dmg2'
-    attrdtag_out = 'attrimat02'
     #datafp_section = 'dmg_fps'
     
-    group_cnt = 4
     
-    plot_fmt = '${:,.0f}'
-    
-    #minimum inventory expectations
-    finv_exp_d = {
-        'f0_tag':{'type':np.object},
-        'f0_scale':{'type':np.number},
-        'f0_elv':{'type':np.number},
-        }
-    
-    #===========================================================================
-    # #expectations from parameter file
-    #===========================================================================
+    #expectations from parameter file
     exp_pars_md = {#mandataory: section: {variable: handles} 
         'parameters' :
             {'name':{'type':str}, 'cid':{'type':str},
@@ -83,6 +79,18 @@ class Dmg2(Model):
              'evals':{'ext':('.csv',)}, #only required for checks
                     },
                     }
+    
+    group_cnt = 4
+    
+    plot_fmt = '${:,.0f}'
+    
+    #minimum inventory expectations
+    finv_exp_d = {
+        'f0_tag':{'type':np.object},
+        'f0_scale':{'type':np.number},
+        'f0_elv':{'type':np.number},
+        }
+
 
     
     def __init__(self,
@@ -97,12 +105,12 @@ class Dmg2(Model):
         super().__init__(cf_fp, **kwargs) #initilzie Model
        
         self.dfuncs_d = dict() #container for damage functions
-
+        
 
         
         self.logger.debug('finished __init__ on Dmg2')
         
-    def _setup(self):
+    def setup(self):
         
         
         
@@ -241,7 +249,6 @@ class Dmg2(Model):
         self.f_ftags = f_ftags
 
     def run(self, #main runner fucntion
-
             ):
         #======================================================================
         # defaults
@@ -264,18 +271,10 @@ class Dmg2(Model):
         log.info('got damages for %i events and %i assets'%(
             len(cres_df), len(cres_df.columns)))
         
-        #=======================================================================
-        # clean
-        #=======================================================================
-        #drop _dmg suffix
-        d1 = pd.Series(self.events_df['dmg'].index, index=self.events_df['dmg']).to_dict()
-        cres_df = cres_df.rename(columns=d1)
-        
-        
         #======================================================================
         # checks
         #======================================================================
-        
+        self.feedback.setProgress(95)
         fdf = self.data_d['finv']
         
         miss_l = set(fdf.index.values).symmetric_difference(cres_df.index.values)
@@ -283,8 +282,6 @@ class Dmg2(Model):
         assert len(miss_l) == 0, 'result inventory mismatch: \n    %s'%miss_l
         assert np.array_equal(fdf.index, cres_df.index), 'index mismatch'
         
-        
-        self.feedback.setProgress(90)
         #=======================================================================
         # report
         #=======================================================================
@@ -297,7 +294,8 @@ class Dmg2(Model):
         return cres_df
         
     def bdmg(self, #get damages on expanded finv
-
+             
+             #run controls
 
             ):
         #======================================================================
@@ -307,9 +305,13 @@ class Dmg2(Model):
         
         #set some locals
         bdf = self.bdf  #expanded finv. see modcom.build_exp_finv(). each row has 1 ftag
-        ddf = self.ddf #exposure set. wsl at each cid
+        ddf = self.ddf
         """ddf is appending _1 to column names"""
         cid, bid = self.cid, self.bid
+        
+
+
+        
         
         assert bid in ddf.columns
         assert ddf.index.name == bid
@@ -328,7 +330,8 @@ class Dmg2(Model):
         resserved for future dev
         
         one value per cid?
- 
+        
+        view(bdf)
         """
 
         
@@ -512,7 +515,7 @@ class Dmg2(Model):
                 raise Error('failed w/ \n    %s'%e)
                 
         log.info('scaled damages')
-        self.feedback.setProgress(70)
+        self.feedback.setProgress(80)
         #======================================================================
         #CAPPED------------
         #======================================================================
@@ -552,9 +555,7 @@ class Dmg2(Model):
             len(meta_d), len(res_df), meta_d))
         
         log.info('capped damages')
-        self.feedback.setProgress(80)
-        
-        
+        self.feedback.setProgress(90)
         #======================================================================
         # DMG-------------
         #======================================================================
@@ -564,13 +565,13 @@ class Dmg2(Model):
             res_df[e_ser['dmg']] = res_df.loc[:, boolcol].fillna(0)
             
         log.info('got final damages')
-        
+        self.feedback.setProgress(92)
         
         #=======================================================================
         # meta--------
         #=======================================================================
         #set these for use later
-        self.bdmg_df = res_df #raw... no columns dropped yet
+        self.bdmg_df = res_df
         self.events_df = events_df.copy()
         self.cmeta_df = cmeta_df
 
@@ -585,16 +586,14 @@ class Dmg2(Model):
                 
         #columns to keep
         boolcol = res_df.columns.isin([cid, bid]+ events_df['dmg'].tolist())
+        
         res_df1 = res_df.loc[:, boolcol]
         
         assert res_df1.notna().all().all(), 'got some nulls'
         
         log.info('finished w/ %s'%str(res_df1.shape))
-        self.feedback.setProgress(85)
         return res_df1
         """
-        self.resname
-        view(events_df)
         view(res_df)
         view(res_df1)
         """
@@ -817,145 +816,36 @@ class Dmg2(Model):
         
         
         return fig
-    
-    def get_attribution(self, #build the attreibution matrix
-                        cres_df, # asset totals (asset:eventRaster:impact)
-                        bdmg_df=None, # nested impacts (bid:eventRaster:impact)
-                        events_df=None,  #keys to bdmg_df column
-                        grpColn = 'nestID', #column name (in bdmg_df) to group on
-                        logger=None):
+    """
+    plt.show()
+    """
 
-        #=======================================================================
-        # defaults
-        #=======================================================================
-        if logger is None: logger=self.logger
-        
-        """
-        even though we're called explicitly...
-            adding the check for consistency
-        """
-        assert self.attriMode
-        
-        log = logger.getChild('get_attribution')
-        cid = self.cid
-        
-        if bdmg_df is None: bdmg_df=self.bdmg_df.copy()
-        if events_df is None: events_df = self.events_df.copy()
-        
-        #=======================================================================
-        # check data
-        #=======================================================================
-        assert cid in bdmg_df.columns
-        assert grpColn in bdmg_df.columns
-        
-        #check asset cids
-        miss_l = set(bdmg_df[cid]).symmetric_difference(cres_df.index)
-        assert len(miss_l)==0, 'key mismatch'
+
+
         
 
         
-        #=======================================================================
-        # clean bdmg
-        #=======================================================================
-        #get conversion d {oldName:newName}
-        d1 = pd.Series(events_df['dmg'].index, index=events_df['dmg']).to_dict()
         
-        #get just the columsn of interest (and drop the _dmg sufix)
-        boolcol = bdmg_df.columns.isin([cid, grpColn]+ list(d1.keys()))
-        bdf = bdmg_df.loc[:, boolcol].rename(columns=d1) 
-        
-        #=======================================================================
-        # check data2
-        #=======================================================================
-        #check eventRasters
-        miss_l = set(cres_df.columns).difference(bdf.columns)
-        assert len(miss_l)==0, 'event rastesr mismatch'
-
-        
-        #=======================================================================
-        # get pivot
-        #=======================================================================
-        #cid: dxcol(l1:eventName, l2:nestID)
-        bdmg_dxcol = bdf.pivot(
-            index=cid, columns=grpColn, values=cres_df.columns.to_list())
-        
-        #set new level names
-        bdmg_dxcol.columns.set_names(['rEventName', grpColn], inplace=True)
-        
-        
-        
-        #=======================================================================
-        # calc attribution
-        #=======================================================================
-        assert np.array_equal(cres_df.index, bdmg_dxcol.index), ' index mismatch'
-        
-        #divide bdmg entries by total results values (for each level)
-        """ for asset, revents, nestID couples with zero impact, will get null
-        leaving these so the summation validation still works"""
-        atr_dxcol_raw = bdmg_dxcol.divide(cres_df, axis='columns', level='rEventName')
-        
-
-        log.debug('built raw attriM w/ %i (of %i) nulls'%(
-            atr_dxcol_raw.isna().sum().sum(), atr_dxcol_raw.size))
-
-        
-        #=======================================================================
-        # handle nulls----
-        #=======================================================================
-        atr_dxcol = self._attriM_nulls(cres_df, atr_dxcol_raw, logger=log)
-
-        
-        #=======================================================================
-        # wrap
-        #=======================================================================
-        
-        
-        #set for writing
-        self.att_df = atr_dxcol.copy()
-        log.info('finished w/ %s'%str(atr_dxcol.shape))
-        return atr_dxcol
-        
-        
- 
     def upd_cf(self, #update the control file 
-               out_fp = None,
-               cf_fp = None,
-               ):
+               out_fp = None,cf_fp = None):
         #======================================================================
         # set defaults
         #======================================================================
         if out_fp is None: out_fp = self.out_fp
         if cf_fp is None: cf_fp = self.cf_fp
         
-        #=======================================================================
-        # convert to relative
-        #=======================================================================
-        if not self.absolute_fp:
-            out_fp = os.path.split(out_fp)[1]
-        
         return self.update_cf(
             {
             'risk_fps':(
-                {'dmgs':out_fp}, 
-                '#\'dmgs\' file path set from dmg2.py at %s'%(
-                    datetime.datetime.now().strftime('%Y-%m-%d %H.%M.%S')),
+                {'dmgs':self.out_fp}, 
+                '#\'dmgs\' file path set from dmg2.py at %s'%(datetime.datetime.now().strftime('%Y-%m-%d %H.%M.%S')),
                 ),
-            'validation':({'risk2':'True'},)
+            'validation':(
+                {'risk2':'True'},
+                )
              },
             cf_fp = cf_fp
             )
-        
-    def output_bdmg(self, #short cut for saving the expanded reuslts
-                    ofn = None):
-        if ofn is None:
-            ofn = 'dmgs_expnd_%s_%s'%(self.name, self.tag)
-            
-        return self.output_df(self.bdmg_df, ofn)
-    
-
-            
-            
-        
                    
 class DFunc(ComWrkr, 
             ): #damage function
@@ -1102,7 +992,70 @@ class DFunc(ComWrkr,
         return {**{'min_dep':min(deps), 'max_dep':max(deps), 
                 'min_dmg':min(dmgs), 'max_dmg':max(dmgs), 'dcnt':len(deps)},
                 **self.pars_d}
-
+#===============================================================================
+# def run():
+# 
+#     #==========================================================================
+#     # dev data
+#     #=========================================================================
+#     #==========================================================================
+#     # out_dir = os.path.join(os.getcwd(), 'dmg2')
+#     # tag='dev'
+#     # 
+#     # cf_fp = r'C:\LS\03_TOOLS\_git\CanFlood\Test_Data\model\dmg2\CanFlood_dmg2.txt'
+#     #==========================================================================
+#     
+#     #==========================================================================
+#     # tutorial 2
+#     #==========================================================================
+# 
+#     runpars_d={
+#         'Tut2':{
+#             'out_dir':os.path.join(os.getcwd(), 'dmg2', 'Tut2'),
+#             'cf_fp':r'C:\LS\03_TOOLS\_git\CanFlood\tutorials\2\built\CanFlood_tut2.txt',
+#             }
+#         }
+#     
+#     #===========================================================================
+#     # GolderHazard test
+#     #===========================================================================
+#     runpars_d={
+#         'run1':{
+#             'out_dir':r'C:\LS\03_TOOLS\CanFlood\_ins\IBI_GolderHazard_20200507\results\wi_noFail2',
+#             'cf_fp':r'C:\LS\03_TOOLS\CanFlood\_ins\IBI_GolderHazard_20200507\build\CanFlood_GH_wi_noFail.txt',
+#             }
+#         }
+# 
+#     
+#     #==========================================================================
+#     # build/execute
+#     #==========================================================================
+#     for tag, pars in runpars_d.items():
+#         cf_fp, out_dir = pars['cf_fp'], pars['out_dir']
+#         log = mod_logger.getChild(tag)
+#         assert os.path.exists(cf_fp)
+#         
+#         wrkr = Dmg2(cf_fp, out_dir=out_dir, logger=log, tag=tag).setup()
+#         
+#         res_df = wrkr.run()
+#         
+#         if res_df is None:
+#             log.warning('skipping')
+#             continue
+#         #==========================================================================
+#         # output
+#         #==========================================================================
+#         
+#         out_fp = wrkr.output_df(res_df, wrkr.resname)
+#         
+#         wrkr.upd_cf()
+# 
+#     #===========================================================================
+#     # wrap--------
+#     #===========================================================================
+#     force_open_dir(out_dir)
+#     
+#===============================================================================
 if __name__ =="__main__": 
 
     print('finished')
