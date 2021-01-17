@@ -3,14 +3,14 @@
 ui class for the MODEL toolset
 """
 
-import os,  os.path, warnings, tempfile, logging, configparser, sys, time
+import os,  os.path, time
 from shutil import copyfile
 
 from PyQt5 import uic, QtWidgets
 
 
-from PyQt5.QtCore import QSettings, QTranslator, QCoreApplication, QObject
-from PyQt5.QtGui import QIcon
+#from PyQt5.QtCore import QSettings, QTranslator, QCoreApplication, QObject
+#from PyQt5.QtGui import QIcon
 from PyQt5.QtWidgets import QAction, QFileDialog, QListWidget
 
 # Initialize Qt resources from file resources.py
@@ -20,8 +20,8 @@ from PyQt5.QtWidgets import QAction, QFileDialog, QListWidget
 
 
 # User defined imports
-from qgis.core import *
-from qgis.analysis import *
+from qgis.core import QgsMapLayerProxyModel, QgsVectorLayer
+#from qgis.analysis import *
 import qgis.utils
 import processing
 from processing.core.Processing import Processing
@@ -45,7 +45,8 @@ import results.djoin
 
 
 import hlpr.plug
-from hlpr.basic import *
+from hlpr.basic import force_open_dir
+from hlpr.exceptions import QError as Error
 
 
 # This loads your .ui file so that PyQt can populate your plugin with the elements from Qt Designer
@@ -246,12 +247,13 @@ class Modelling_Dialog(QtWidgets.QDialog, FORM_CLASS,
         out_dir = self.get_wd()
         tag = self.linEdit_Stag.text()
         res_per_asset = self.checkBox_r2rpa_2.isChecked()
+        absolute_fp = self._get_absolute_fp()
 
         #=======================================================================
         # setup/execute
         #=======================================================================
-        model = Risk1(cf_fp, out_dir=out_dir, logger=self.logger, tag=tag,
-                      feedback=self.feedback).setup()
+        model = Risk1(cf_fp, out_dir=out_dir, logger=self.logger, tag=tag,absolute_fp=absolute_fp,
+                      feedback=self.feedback)._setup()
         
         res, res_df = model.run(res_per_asset=res_per_asset)
         
@@ -289,27 +291,42 @@ class Modelling_Dialog(QtWidgets.QDialog, FORM_CLASS,
         
     def run_impact2(self):
         log = self.logger.getChild('run_impact2')
+        #=======================================================================
+        # retrive variable values
+        #=======================================================================
         cf_fp = self.get_cf_fp()
         out_dir = self.get_wd()
         tag = self.linEdit_Stag.text()
-
+        absolute_fp = self._get_absolute_fp()
+        
         #======================================================================
         # #build/run model
         #======================================================================
-        model = Dmg2(cf_fp, out_dir = out_dir, logger = self.logger, tag=tag,
-                     feedback=self.feedback).setup()
+        model = Dmg2(cf_fp, out_dir = out_dir, logger = self.logger, tag=tag, 
+                     absolute_fp=absolute_fp,
+                     feedback=self.feedback)._setup()
         
         #run the model        
         cres_df = model.run()
         
-
+        #attribution
+        if self.checkBox_SS_attr.isChecked():
+            _ = model.get_attribution(cres_df)
+            model.output_attr(upd_cf = self.checkBox_SS_updCf.isChecked())
+        
+        self.feedback.setProgress(95)
         #======================================================================
         # save reuslts
         #======================================================================
         out_fp = model.output_df(cres_df, model.resname)
         
         #update parameter file
-        model.upd_cf()
+        if self.checkBox_SS_updCf.isChecked():
+            model.upd_cf()
+            
+        #output expanded results
+        if self.checkBox_i2_outExpnd.isChecked():
+            _ = model.output_bdmg()
 
         self.logger.push('Impacts2 complete')
         self.feedback.upd_prog(None) #set the progress bar back down to zero
@@ -322,8 +339,6 @@ class Modelling_Dialog(QtWidgets.QDialog, FORM_CLASS,
             self.logger.info('linking in Risk 2')
             self.run_risk2()
             
-        
-    
     def run_risk2(self):
         #======================================================================
         # get run vars
@@ -334,33 +349,48 @@ class Modelling_Dialog(QtWidgets.QDialog, FORM_CLASS,
         out_dir = self.get_wd()
         tag = self.linEdit_Stag.text()
         res_per_asset = self.checkBox_r2rpa.isChecked()
+        absolute_fp = self._get_absolute_fp()
         
 
         #======================================================================
         # run the model
         #======================================================================
-        model = Risk2(cf_fp, out_dir=out_dir, logger=self.logger, tag=tag,
-                      feedback=self.feedback)._setup()
+        model = Risk2(cf_fp, out_dir=out_dir, logger=self.logger, tag=tag,absolute_fp=absolute_fp,
+                      feedback=self.feedback, attriMode=self.checkBox_SS_attr.isChecked(),
+                      )._setup()
         
-        res_ser, res_df = model.run(res_per_asset=res_per_asset)
+        res_ttl, res_df = model.run(res_per_asset=res_per_asset)
         
         #======================================================================
         # plot
         #======================================================================
         if self.checkBox_r2plot.isChecked():
-            fig = model.risk_plot()
+            ttl_df = model.prep_dtl(tlRaw_df=res_ttl)
+            """just giving one curve here"""
+            fig = model.plot_riskCurve(ttl_df, y1lab='impacts')
             _ = model.output_fig(fig)
        
         #=======================================================================
         # output
         #=======================================================================
-        model.output_df(res_ser, '%s_%s'%(model.resname, 'ttl'))
+        #risk results
+        model.output_ttl(upd_cf = self.checkBox_SS_updCf.isChecked())
         
         out_fp2=''
         if not res_df is None:
-            out_fp2= model.output_df(res_df, '%s_%s'%(model.resname, 'passet'))
+            out_fp2= model.output_passet(upd_cf = self.checkBox_SS_updCf.isChecked())
+            
+
+            
+        #attribution
+        if self.checkBox_SS_attr.isChecked():
+            model.output_attr(upd_cf = self.checkBox_SS_updCf.isChecked())
         
-        
+        #event metadata
+        model.output_etype(upd_cf = self.checkBox_SS_updCf.isChecked())
+        #=======================================================================
+        # wrap
+        #=======================================================================
         tdelta = (time.time()-start)/60.0
         self.logger.push('Risk2 complete in %.4f mins'%tdelta)
         self.feedback.upd_prog(None) #set the progress bar back down to zero
@@ -374,7 +404,6 @@ class Modelling_Dialog(QtWidgets.QDialog, FORM_CLASS,
 
         return
 
-        
     def run_risk3(self):
         
         #======================================================================
@@ -431,7 +460,9 @@ class Modelling_Dialog(QtWidgets.QDialog, FORM_CLASS,
     
         self.feedback.upd_prog(None) #set the progress bar back down to zero
         
-    def results_joinGeo(self, data_fp, wd, tag):
+    def results_joinGeo(self, 
+                        data_fp, #filepath to res_per asset tabular results data 
+                        wd, tag):
         """
         not a good way to have the user specify the 
         
@@ -445,15 +476,13 @@ class Modelling_Dialog(QtWidgets.QDialog, FORM_CLASS,
         #=======================================================================
         geo_vlay = self.comboBox_JGfinv.currentLayer()
         cid = self.mFieldComboBox_JGfinv.currentField() #user selected field
-        crs = self.qproj.crs()
+
         #=======================================================================
         # check inputs
         #=======================================================================
         assert isinstance(geo_vlay, QgsVectorLayer), \
             'need to specify a geometry layer on the \'Setup\' tab to join results to'
             
-        assert isinstance(crs, QgsCoordinateReferenceSystem)
-        assert crs.isValid()
         
         #check cid
         assert isinstance(cid, str), 'bad index FieldName passed'
@@ -471,7 +500,7 @@ class Modelling_Dialog(QtWidgets.QDialog, FORM_CLASS,
         wrkr = results.djoin.Djoiner(logger=self.logger, 
                                      tag = tag,
                                      feedback=self.feedback,
-                                     cid=cid, crs=crs,
+                                     cid=cid, 
                                      out_dir=wd)
         #execute
         res_vlay = wrkr.run(geo_vlay, data_fp, cid,
@@ -488,6 +517,18 @@ class Modelling_Dialog(QtWidgets.QDialog, FORM_CLASS,
         self.feedback.upd_prog(None)
         log.push('run_joinGeo finished')
         
+    def _get_absolute_fp(self): #helper to get the absoulte filepath flag
+        if self.radioButton_S_fpAbs.isChecked():
+            absolute_fp=True
+            assert not self.radioButton_S_fpRel.isChecked()
+            
+        elif self.radioButton_S_fpRel.isChecked():
+            absolute_fp=False
+            
+        else:
+            raise Error('butotn logic fail')
+        
+        return absolute_fp
         
         
         

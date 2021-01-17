@@ -11,8 +11,9 @@ Created on Feb. 9, 2020
 # imports------------
 #==============================================================================
 
-import configparser, os, inspect, logging
+import configparser, os, inspect, logging, copy, itertools, datetime
 import pandas as pd
+idx = pd.IndexSlice
 import numpy as np
 
 from scipy import interpolate, integrate
@@ -20,41 +21,47 @@ from scipy import interpolate, integrate
 #==============================================================================
 # custom
 #==============================================================================
-#standalone runs
-if __name__ =="__main__": 
-    from hlpr.logr import basic_logger
-    mod_logger = basic_logger()   
 
-    
-#plugin runs
-else:
-    mod_logger = logging.getLogger('common') #get the root logger
+mod_logger = logging.getLogger('common') #get the root logger
 
 from hlpr.exceptions import QError as Error
     
-from hlpr.basic import *
+from hlpr.basic import ComWrkr, view
 
 #==============================================================================
 # class-----------
 #==============================================================================
-class Model(ComWrkr):
+class Model(ComWrkr,
+            #Plotr #making each child inherit this speifically
+                #keeps damage modeuls without plotting a bit simpler
+            ):
     """
     common methods for model classes
     
     
     Control File Parameters:
-        [parameters]
+    [parameters]
+        
+        name -- name of the scenario/model run
+        
+        cid -- index column for the 3 inventoried data sets (finv, expos, gels)
+        
+        prec -- float precision for calculations
+        
+        ground_water -- flag to include negative depths in the analysis
+        
+        felv -- 'datum' or 'ground': whether felv values provided in the
+                     inventory are heights or elevations
 
-        event_probs -- format of event probabilities (in 'aeps' data file) 
+        event_probs -- format of event probabilities (in 'evals' data file) 
                         (default 'ari')
                         
-            'aeps'           event probabilities in aeps file expressed as 
+            'aep'           event probabilities in aeps file expressed as 
                             annual exceedance probabilities
-            'aris'           expressed as annual recurrance intervals
+            'ari'           expressed as annual recurrance intervals
             
         
-        ltail -- zero probability event extrapolation handle 
-                (default 'extrapolate')
+        ltail -- zero probability event  handle  (default 'extrapolate')
             'flat'           set the zero probability event equal to the most 
                             extreme impacts in the passed series
             'extrapolate'    set the zero probability event by extrapolating from 
@@ -63,35 +70,50 @@ class Model(ComWrkr):
             float            use the passed value as the zero probability impact value
              
         
-        rtail -- zreo impacts event extrapolation handle    (default 0.5)
+        rtail -- zreo impacts event  handle    (default float(0.5))
             'extrapolate'    set the zero impact event by extrapolating from the 
                             least extreme impact
-            'none'           do not extrapolate (not recommended) 
+            'none'            no enforcing of a zero impact event (not recommended)
+            'flat'           duplicates the minimum AEP as the zero damage event 
             float           use the passed value as the zero impacts aep value
         
-        drop_tails -- flag to drop the extrapolated values from the results 
-                            (default True)
+        drop_tails -- EAD extrapolation: whether to remove the extrapolated values
+                         before writing the per-asset results (default: False)
         
         integrate -- numpy integration method to apply (default 'trapz')
-        
-        res_per_asset -- flag to generate results per asset 
-        
-        ground_water -- flag to include negative depths in the analysis
-        
+
         as_inun    -- flag whether to treat exposures as %inundation
         
-        [dmg_fps]
+        event_rels -- assumption for calculated expected value on complex events
+            #max:  maximum expected value of impacts per asset from the duplicated events
+                #resolved damage = max(damage w/o fail, damage w/ fail * fail prob)
+                #default til 2020-12-30
+            #mutEx: assume each event is mutually exclusive (only one can happen)
+                #lower bound
+            #indep: assume each event is independent (failure of one does not influence the other)
+                #upper bound
+            
+            
+        
+    [dmg_fps]
+        
 
         
-        [risk_fps]
+    [risk_fps]
         dmgs -- damage data results file path (default N/A)
             
         exlikes -- secondary exposure likelihood data file path (default N/A)
         
         evals -- event probability data file path (default N/A)
         
-        [validation]
+    [validation]
         risk2 -- Risk2 validation flag (default False)
+        
+    [results_fps]
+        attrimat02 -- attribution matrix file path
+        r2_passet -- per_asset results from the risk2 model
+        r2_ttl  -- total results from risk2
+        eventypes -- df of aep, noFail, and rEventName
     
     """
     
@@ -110,6 +132,7 @@ class Model(ComWrkr):
     drop_tails = True
     integrate = 'trapz'
     as_inun = False
+    event_rels = 'max'
 
 
     
@@ -131,6 +154,16 @@ class Model(ComWrkr):
     risk2 = False
     risk3 = False
     
+    #[results_fps]
+    attrimat02=''
+    attrimat03=''
+    r2_passet=''
+    r2_ttl =''
+    eventypes=''
+    
+    #[plotting]
+    """see ComWrkr"""
+    
     #==========================================================================
     # program vars
     #==========================================================================
@@ -144,27 +177,57 @@ class Model(ComWrkr):
     
     max_depth = 20 #maximum depth for throwing an error in build_depths()
     
+    extrap_vals_d = {} #extraploation used {aep:val}
+    cplx_evn_d = None #complex event sets {aep: [exEventName1, exEventName1]}
+    asset_cnt = 0 #for plotting
+    scen_ar_d = dict() #container for empty scenario matrix
+    
 
-    
-    
     def __init__(self,
-                 cf_fp, #control file path """ note: this could also be attached by basic.ComWrkr.__init__()"""
+                 cf_fp, #control file path 
+                    #note: this could also be attached by basic.ComWrkr.__init__()
+                    #now that this is a parent... wish this was a kwarg
+                 
                  split_key=None,#for checking monotonicy on exposure sets with duplicate events
-
-
+                 absolute_fp=True, #whether filepaths are absolute (False=Relative)
+                 attriMode = False, #flow control for some attribution matrix functions
+                 
                  **kwargs):
         
+        #=======================================================================
+        # precheck
+        #=======================================================================
         mod_logger.info('Model.__init__ start')
         assert os.path.exists(cf_fp), 'bad control filepath: %s'%cf_fp
         
-        super().__init__(**kwargs) #initilzie teh baseclass
+        #=======================================================================
+        # parent setup
+        #=======================================================================
+        super().__init__(cf_fp=cf_fp, **kwargs) #initilzie teh baseclass
         
-        self.cf_fp = cf_fp
-        self.split_key= split_key
+        """have to call on child's init
+        self._init_plt() #setup matplotlib"""
         
+        #=======================================================================
+        # attachments
+        #=======================================================================
+        """ moved to Comwrkr
+        self.cf_fp = cf_fp"""
+        self.split_key= split_key 
+        
+        """TODO: Consider moving this to ComWrkr so Build dialogs can access"""
+        self.absolute_fp=absolute_fp
+        
+        
+        self.attriMode=attriMode
 
-        #attachments
-        self.data_d = dict() #dictionary for loaded data sets
+
+        """moved to comWrkr
+        self.data_d = dict() #dictionary for loaded data sets"""
+        
+        #=======================================================================
+        # wrap
+        #=======================================================================
         
         self.logger.debug('finished Model.__init__')
         
@@ -175,12 +238,59 @@ class Model(ComWrkr):
         should be called by the model's own 'setup()' func
             during standalones and Dialog runs
         """        
+        log = self.logger.getChild('init_model')
+        #=======================================================================
+        # #parameter setup-----
+        #=======================================================================
+        #=======================================================================
+        # load the control file
+        #=======================================================================
+        cf_fp = self.cf_fp
+        assert os.path.exists(cf_fp), 'provided parameter file path does not exist \n    %s'%cf_fp
+
+        self.pars = configparser.ConfigParser(inline_comment_prefixes='#')
+        log.info('reading parameters from \n     %s'%self.pars.read(cf_fp))
         
-        #parameter setup
-        self.cf_attach_pars(self.cf_fp)
+        #=======================================================================
+        # filepaths
+        #=======================================================================
+        if not self.absolute_fp:
+            log.info('converting relative filepaths')
+            self.pars = self._cf_relative(self.pars, os.path.split(cf_fp)[0])
+            """
+            self.pars.__dict__
+            """
+            
+            
+        
+        #=======================================================================
+        # check against expectations
+        #=======================================================================
+        errors = []
+        for chk_d, opt_f in ((self.exp_pars_md,False), (self.exp_pars_op,True)):
+            _, l = self.cf_chk_pars(self.pars, copy.copy(chk_d), optional=opt_f)
+            errors = errors + l
+            
+        #report on all the errors
+        for indxr, msg in enumerate(errors):
+            log.error('error %i: \n%s'%(indxr+1, msg))
+                    
+                
+        #final trip
+        """lets us loop through all the checks before failing"""
+        if not len(errors)==0:        
+            raise Error('failed to validate ControlFile w/ %i error(s)... see log'%len(errors))
+            
+        #=======================================================================
+        # attach control file parameter values
+        #=======================================================================
+
+        _ = self.cf_attach_pars(self.pars)
         
         
-        #check our validity tag
+        #=======================================================================
+        # #check our validity tag
+        #=======================================================================
         if not getattr(self, self.valid_par):
             raise Error('control file not validated for \'%s\'. please run InputValidator'%self.valid_par)
         
@@ -188,166 +298,233 @@ class Model(ComWrkr):
         self.logger.debug('finished init_modelon Model')
         
         
+    def cf_chk_pars(self,
+                   cpars,
+                   chk_d,
+                   optional=False, #whether the parameters are optional
+                   ):
+        """
         
-    def cf_attach_pars(self, #load parmaeteres from file, check, and attach
-                    cf_fp):
+        """
         
-        log = self.logger.getChild('cf_attach_pars')
+        log = self.logger.getChild('cf_chk_pars')
         
-        assert os.path.exists(cf_fp), 'provided parameter file path does not exist \n    %s'%cf_fp
+        #=======================================================================
+        # precheck
+        #=======================================================================
+        assert isinstance(cpars, configparser.ConfigParser)
+        """checks are done on a configparser (rather than a dictionary)
+        to better handle python's type reading from files"""
+        assert isinstance(chk_d, dict)
+        if not optional: assert len(chk_d)>0
+        assert len(cpars)>0
         
-        #======================================================================
-        # validate the control file for this run
-        #======================================================================
-        #load/build
-        self.pars = configparser.ConfigParser(inline_comment_prefixes='#')
-        log.info('reading parameters from \n     %s'%self.pars.read(cf_fp))
         
-        #======================================================================
-        # check control file against expectations
-        #======================================================================
-        #check sections
-        miss_l = set(self.exp_pars_md.keys()).difference(self.pars.sections())
+        #=======================================================================
+        # #section check
+        #=======================================================================
+        miss_l = set(chk_d.keys()).difference(cpars.sections())
         
         if len(miss_l) > 0:
-            raise Error('missing %i expected sections in control file: %s'%(len(miss_l), miss_l))
+            log.warning('missing %i expected sections in control file: %s'%(len(miss_l), miss_l))
         
-        #======================================================================
-        # mandatory check and collect -----
-        #======================================================================
-        cpars_d = dict()
-        cnt = 0
-        for sect, vchk_d in self.exp_pars_md.items():
-            cpars_d[sect] = dict()
+        
+        #=======================================================================
+        # variable check
+        #=======================================================================
+        errors = [] #container for errors
+        for sectName, vchk_d in chk_d.items():
+            if not sectName in cpars: continue #allow for backward scompatailbiity
+            csectName = cpars[sectName] #get these parameters
             
-            if not sect in self.pars.sections():
-                raise Error('missing section %s'%sect)
+            #===================================================================
+            # #check all the expected keys are there
+            #===================================================================
             
-            #check presence
-            miss_l = set(vchk_d.keys()).difference(self.pars[sect])
+            miss_l = set(vchk_d.keys()).difference(list(csectName))
             if len(miss_l) > 0:
                 raise Error('\'%s\' missing %i (of %i) expected varirables: \n    %s'%(
-                    sect, len(miss_l), len(vchk_d), miss_l))
+                    sectName, len(miss_l), len(vchk_d), miss_l))
                 
-            #check attributes
-            for varnm, achk_d in vchk_d.items():
-                """no! allow None
-                assert isinstance(achk_d, dict), '%s.%s bad type'%(sect, varnm)"""
-                assert hasattr(self, varnm), '\'%s\' does not exist on %s'%(varnm, self)
-
                 
-                #==============================================================
-                # #get value from parameter                
-                #==============================================================
-                pval_raw = self.pars[sect][varnm]
+            #===================================================================
+            # #check attributes with handles
+            #===================================================================
+            log.debug('checking section \'%s\' against %i variables'%(sectName, len(vchk_d)))
+            for varName, achk_d in vchk_d.items(): #loop through the expectations
                 
-                #get native type
-                ntype = type(getattr(self, varnm))
-                
-                #special type retrivial
-                if ntype == bool:
-                    pval = self.pars[sect].getboolean(varnm)
-                elif getattr(self, varnm) is None:
-                    pval = pval_raw #no check or type conversion
-
-                else:
-                    #set the type
-                    try:
-                        pval = ntype(pval_raw)
-                    except Exception as e:
-                        raise Error('failed to set %s.%s  with input \'%s\' (%s) to %s \n %s'%(
-                            sect, varnm, pval_raw, type(pval_raw), ntype, e))
-                
-                #==============================================================
-                # check it
-                #==============================================================
-                self.par_hndl_chk(sect, varnm, pval, achk_d)
-                
-
-                #==============================================================
-                # store value
-                #==============================================================
-                
-                cpars_d[sect][varnm] = pval
-                cnt +=1
-        
-        log.info('collected MANDATORY %i variables from %i sections from paramter file'%(
-            cnt, len(cpars_d)))
-        #======================================================================
-        # optional check and collect----
-        #======================================================================
-        cnt2 = 0
-        for sect, vchk_d in self.exp_pars_op.items(): 
-            #add a page to the container
-            if not sect in cpars_d:
-                cpars_d[sect] = dict()
-                
-            #loop and see if they have been provided
-            for varnm, achk_d in vchk_d.items():
-                #assert isinstance(achk_d, dict), '%s.%s bad type'%(sect, varnm)
-                assert hasattr(self, varnm), '\'%s\' does not exist on %s'%(varnm, self)
-                assert varnm in self.pars[sect], '%s.%s is not a valid parameter'%(sect, varnm)
-                
-                #==============================================================
-                # #get value from parameter                
-                #==============================================================
-                pval_raw = self.pars[sect][varnm]
-                
-                if pval_raw is None or pval_raw == '':
-                    log.debug('%s.%s blank.. skipping'%(sect, varnm))
+                try: #attempt to tpye set, better error reporting/catching
+                    pval = self._get_from_cpar(cpars, sectName, varName, logger=log) #get the typeset variable
+                    
+                except Exception as e: #failed to even typeset... mark as an error and move forward
+                    errors.append(e)
                     continue
                 
-                #get native type
-                ntype = type(getattr(self, varnm))
+                #===============================================================
+                # blanks/nulls
+                #===============================================================
+                if (pd.isnull(pval) or pval==''):
+                    msg = 'no value provided for \'%s.%s\'. optional=%s'%(sectName, varName, optional)
+                    if optional:
+                        log.debug(msg)
+                        continue
+                    else:
+                        errors.append(msg)
+                        
+                else: #expected some value
                 
-                #special type retrivial
-                if ntype == bool:
-                    pval = self.pars[sect].getboolean(varnm)
-                else:
-                    #set the type
-                    pval = ntype(pval_raw)
-                
-                #==============================================================
-                # check it
-                #==============================================================
-                self.par_hndl_chk(sect, varnm, pval, achk_d)
-                
-                #==============================================================
-                # store value
-                #==============================================================
-                log.debug('%s.%s passed %i checks'%(sect, varnm, len(achk_d)))
-                cpars_d[sect][varnm] = pval
-                cnt2+=1
+                    try:
+                        _ = self._par_hndl_chk(sectName, varName, pval, achk_d, logger=log) #check with handles
+                    except Exception as e:
+                        errors.append(e)
+                    
+            
+            
+        log.info('finished checking %i sections w/ %i errors. optional=%s \n'%(len(cpars), len(errors), optional))
         
-        log.info('collected OPTIONAl %i variables from %i sections from paramter file'%(
-            cnt2, len(cpars_d)))
+        return len(errors)==0, errors
         
+    def cf_attach_pars(self, #load parmaeteres from file
+                    cpars,
+                    setAttr=True, #whether to save each attribute 
+                    ):
+        
+        """
+        cf_chk_pars() should be run first to make sure parameter membership and type matches expectations
+        
+        here we just update every parameter value found:
+            on the class
+            in the ControlFile
+        """
+        
+        
+        #=======================================================================
+        # defaults
+        #=======================================================================
+        log = self.logger.getChild('cf_attach_pars')
+        #=======================================================================
+        # precheck
+        #=======================================================================
+        assert isinstance(cpars, configparser.ConfigParser)
+        
+        
+        #=======================================================================
+        # loop and retrieve
+        #=======================================================================
+        cpars_d = dict() #set values
+        no_d = dict() #not set values
+        noCnt = 0
+        for sectName in cpars.sections():
+            cpars_d[sectName], no_d[sectName] = dict(), dict() #add the page
+            log.debug('loading %i parameters from section \'%s\''%(len(cpars[sectName]), sectName))
+            
+            #loop through each variable name/value in this section
+            for varName, valRaw in cpars[sectName].items():
+                
+                #check we care about this
+                if not hasattr(self, varName):
+                    log.debug('passed variable \'%s\' not found on class... skipping'%varName)
+                    no_d[sectName][varName] = valRaw
+                    noCnt+=1
+                    continue
+                
+                
+                #retrieve typset value
+                pval = self._get_from_cpar(cpars, sectName, varName, logger=log) #get the typeset variable
+                
+                #store it
+                cpars_d[sectName][varName] = pval 
+                
         #======================================================================
         # attach all the paramers
         #======================================================================
         cnt = 0
-        for sect, spars_d in cpars_d.items():
-            for varnm, val in spars_d.items():
-                setattr(self, varnm, val)
-                log.debug('set %s=%s'%(varnm, val))
-                cnt +=1
+        if setAttr:
+            
+            for sectName, spars_d in cpars_d.items():
+                for varnm, val in spars_d.items():
+                    setattr(self, varnm, val)
+                    log.debug('set %s=%s'%(varnm, val))
+                    cnt +=1
                 
-        log.info('attached %i parmaeters to self'%cnt)
+        #=======================================================================
+        # wrap
+        #=======================================================================
+        log.info('attached %i parmaeters to self (skipped %i)'%(cnt, noCnt))
                 
         
         
         return cpars_d
-                
-                
-                
-    def par_hndl_chk(self, #check a parameter aginast provided handles
-                     sect, varnm, pval, achk_d
+    
+    def _get_from_cpar(self, #special parameter extraction recognizing object's t ype
+                      cpars,
+                      sectName,
+                      varName,
+                      logger = None):
+        
+        """each parameter should exist on teh class instance.
+                we use this to set the type"""
+        
+        if logger is None: logger=self.logger
+        log = logger.getChild('_get_from_cpar')
+        #=======================================================================
+        # get native type on class
+        #=======================================================================
+        assert hasattr(self, varName), '\'%s\' does not exist on %s'%(varName, self)
+        
+        
+        #get class instance's native type
+        ntype = type(getattr(self, varName))
+        
+        #==============================================================
+        # retrive and typeset  (using native t ype)            
+        #==============================================================
+        assert isinstance(cpars, configparser.ConfigParser)
+        
+        csect = cpars[sectName]
+        pval_raw = csect[varName] #raw value (always a string)
+        
+        #boolean
+        if ntype == bool:
+            pval = csect.getboolean(varName)
+        
+        #no check or type conversion
+        elif getattr(self, varName) is None:
+            pval = pval_raw 
+
+        #other types
+        else:
+            try:
+                pval = ntype(pval_raw)
+            except Exception as e:
+                raise Error('failed to set %s.%s  with input \'%s\' (%s) to %s \n %s'%(
+                    sectName, varName, pval_raw, type(pval_raw), ntype, e))
+        
+        #=======================================================================
+        # blank set
+        #=======================================================================
+        """seems like we're setup for ''.... not sure the value in switching everything over
+        if pval == '':
+            pval = np.nan"""
+        
+        log.debug('retrieved \'%s.%s\'=\'%s\' w/ type: \'%s\''%(sectName, varName, pval, type(pval)))
+        return pval
+
+    def _par_hndl_chk(self, #check a parameter aginast provided handles
+                     sect, varnm, pval, achk_d,
+                     logger=None
                      ):
         
-        log = self.logger.getChild('par_hndl_chk')
+        if logger is None: logger=self.logger
+        log = logger.getChild('par_hndl_chk')
+        
+        #=======================================================================
+        # precheck
+        #=======================================================================
         assert not pval is None or pval == '', '%s.%s got none'%(sect, varnm)
+        
         if achk_d is None:
-            log.warning('no checks provided for %s.%s'%(sect, varnm))
+            log.warning('no checks provided for \'%s.%s\'... skipping'%(sect, varnm))
             return
         #==============================================================
         # #check each handle
@@ -362,7 +539,7 @@ class Model(ComWrkr):
                 
             elif chk_hndl == 'values':
                 assert isinstance(hvals, tuple), '%s.%s got bad type on hvals: %s'%(sect, varnm, type(hvals))
-                assert pval in hvals, '%s.%s unexpected value: %s'%(sect, varnm, type(pval))
+                assert pval in hvals, '%s.%s unexpected value: \'%s\''%(sect, varnm, pval)
             
             elif chk_hndl == 'ext':
                 assert isinstance(pval, str), '%s.%s expected a filepath '%(sect, varnm)
@@ -383,10 +560,66 @@ class Model(ComWrkr):
             
             else:
                 raise Error('unrecognized check handle: %s'%chk_hndl)
-        log.debug('%s.%s passed %i checks'%(sect, varnm, len(achk_d)))
-        return
+            
+        log.debug('    \'%s.%s\' passed %i checks'%(sect, varnm, len(achk_d)))
+        return True
     
-
+    def  _cf_relative(self, #convert filepaths from relative to absolute
+                      cpars, #config parser
+                      base_dir, #base directory to add
+                      sections=['dmg_fps', 'risk_fps'], #sections contaiing values to convert
+                      
+                      ):
+        log = self.logger.getChild('_cf_relative')
+        
+        assert os.path.exists(base_dir)
+        
+        #=======================================================================
+        # #loop through parser and retireve then convert
+        #=======================================================================
+        res_d = dict() #container for new values
+        for sectName in sections:
+            assert sectName in cpars
+            res_d[sectName]=dict()
+            #loop through each variable in this section
+            for varName, valRaw in cpars[sectName].items():
+                if valRaw == '': continue #skip blanks
+                
+                #get the absolute filepath
+                fp = os.path.join(base_dir, valRaw)
+                """dont bother... some models may not use all the fps
+                better to let the check with handles catch things
+                assert os.path.exists(fp), '%s.%s not found'%(sectName, varName)"""
+                
+                #set it
+                res_d[sectName][varName]=fp
+                
+        #=======================================================================
+        # set the new values
+        #=======================================================================
+        cnt=0
+        for sectName, sect_d in res_d.items():
+            if len(sect_d)==0: continue #skip blanks
+            
+            for varName, newVal in sect_d.items():
+                cpars.set(sectName, varName, newVal)
+                cnt+=1
+            
+        #=======================================================================
+        # wrap
+        #=======================================================================
+        log.info('converted %i filepaths to absolute'%cnt)
+            
+        """
+        cpars['dmg_fps']['finv']
+        """
+        
+        
+        return cpars
+    
+    #===========================================================================
+    # LOADERS------
+    #===========================================================================
     def load_finv(self,#loading expo data
                    fp = None,
                    dtag = 'finv',
@@ -457,7 +690,7 @@ class Model(ComWrkr):
             
             
         
-    def load_evals(self,#loading expo data
+    def load_evals(self,#loading event probability data
                    fp = None,
                    dtag = 'evals',
                    ):
@@ -486,8 +719,9 @@ class Model(ComWrkr):
         #======================================================================
         # check
         #======================================================================
+        assert aser_raw.notna().all(), 'got some nulls in evals'
         boolar = aser_raw == 0
-        assert not boolar.any(), 'got some zeros in aep_ser'
+        assert not boolar.any(), 'got some zeros in evals'
         #======================================================================
         # convert
         #======================================================================
@@ -504,7 +738,8 @@ class Model(ComWrkr):
         
         #extreme to likely
         aep_ser = aep_ser.sort_values(ascending=True)
-        aep_ser.name='aeps'
+        aep_ser.name='aep'  
+ 
         #======================================================================
         # check range
         #======================================================================
@@ -526,12 +761,20 @@ class Model(ComWrkr):
         
         self.expcols = aep_ser.index.copy() #set for later checks
         
-    def load_expos(self,#loading any exposure type data (expos, or exlikes)
+    def load_expos(self,#generic exposure loader
                    fp = None,
                    dtag = 'expos',
                    check_monot=False, #whether to check monotonciy
                    logger=None,
                    ):
+        """
+        loads, sets index, slices to finv, and lots of checks, adds result to data_d
+        
+        called by:
+            dmg2
+            risk1
+            risk2 (via load_exlikes())
+        """
         #======================================================================
         # defaults
         #======================================================================
@@ -541,9 +784,10 @@ class Model(ComWrkr):
         if fp is None: fp = getattr(self, dtag)
         cid = self.cid
         
+        #=======================================================================
+        # prechecks1
+        #=======================================================================
         assert 'finv' in self.data_d, 'call load_finv first'
-        #assert 'evals' in self.data_d, 'call load_aep first'
-        #assert isinstance(self.expcols, pd.Index), 'bad expcols'
         assert isinstance(self.cindex, pd.Index), 'bad cindex'
         assert os.path.exists(fp), '%s got invalid filepath \n    %s'%(dtag, fp)
         #======================================================================
@@ -552,7 +796,7 @@ class Model(ComWrkr):
         df_raw = pd.read_csv(fp, index_col=None)
         
         #======================================================================
-        # precheck
+        # check raw data
         #======================================================================
         assert cid in df_raw.columns, '%s missing index column \"%s\''%(dtag, cid)
         assert df_raw.columns.dtype.char == 'O','bad event names on %s'%dtag
@@ -575,15 +819,13 @@ class Model(ComWrkr):
         assert len(miss_l) == 0, 'some assets on %s not found in finv'%dtag
         
         #check events
-        """
-        must match the aeps
-        """
+
         if dtag == 'exlikes':
             miss_l = set(df.columns).difference(self.expcols)
         else:
-            miss_l = set(self.expcols).difference(df.columns)
+            miss_l = set(self.expcols).symmetric_difference(df.columns)
             
-        assert len(miss_l) == 0, '%i events on \'%s\' not found in aep_ser: \n    %s'%(
+        assert len(miss_l) == 0, '%i eventName mismatch on \'%s\' and \'evals\': \n    %s'%(
             len(miss_l), dtag, miss_l)
         
         
@@ -623,35 +865,53 @@ class Model(ComWrkr):
         #======================================================================
         # set it
         #======================================================================
-        
+        """consider passing this to caller and letting the caller handel"""
         self.data_d[dtag] = df
+        
         
         log.info('finished loading %s as %s'%(dtag, str(df.shape)))
         
-    def load_exlikes(self,#loading any exposure type data (expos, or exlikes)
+        return
+        
+    def load_exlikes(self,#loading exposure probability data (e.g. failure raster poly samples)
                      dtag = 'exlikes',
                    **kwargs
                    ):
+        """
+        load, fill nulls, add 1.0 for missing, set in data_d
+        called by:
+            risk1
+            risk2
+        """
         
+        #=======================================================================
+        # defaults
+        #=======================================================================
         log = self.logger.getChild('load_exlikes')
         assert 'evals' in self.data_d, 'evals data set required with conditional exposure exlikes'
-        aep_ser = self.data_d['evals']
-        #======================================================================
-        # load the data
-        #======================================================================
+        aep_ser = self.data_d['evals'].astype(float)
         
-        self.load_expos(dtag=dtag, **kwargs) #use the load_expos
+
         
-        edf = self.data_d.pop(dtag)
-        
-        log.info('loading w/ %s'%str(edf.shape))
         #======================================================================
-        # repair assets w/ missing secondaries
+        # load the data-------
         #======================================================================
-        #replace nulls w/ 1
-        """better not to pass any nulls.. but if so.. should treat them as ZERO!!
-        Null = no failure polygon = no failure
+        self.load_expos(dtag=dtag, **kwargs) #load, clean, slice, add to data_d
+        edf = self.data_d.pop(dtag) #pull out the reuslt
+        log.debug('loading w/ %s'%str(edf.shape))
+
+        """TODO: Consider moving these onto the build tool"""
+        #======================================================================
+        # fill nulls-----
+        #======================================================================
+        """
+        better not to pass any nulls.. but if so.. should treat them as ZERO!!
+            Null = no failure polygon = no failure
+            
         also best not to apply precision to these values
+        
+        2020-01-12: moved null filling to lisamp.py
+            keeping it here as well for backwards compatability
         """
         booldf = edf.isna()
         if booldf.any().any():
@@ -659,41 +919,157 @@ class Model(ComWrkr):
         edf = edf.fillna(0.0)
         
         #==================================================================
-        # check
+        # check/add event probability totals----
         #==================================================================
-        #check logic against aeps
-        if aep_ser.is_unique:
-            raise Error('passed exlikes, but there are no duplicated event: \n    %s'%aep_ser)
+        
+        #=======================================================================
+        # assemble complex aeps
+        #=======================================================================
+        #collect event names
+        cplx_evn_d = dict()
+        cnt=0
+        for aep in aep_ser.unique(): #those aeps w/ duplicates:
+            cplx_evn_d[aep] = aep_ser[aep_ser==aep].index.tolist()
+            cnt=max(cnt, len(cplx_evn_d[aep])) #get the size of the larget complex event
         
 
-        #==================================================================
-        # #add missing likelihoods
-        #==================================================================
-        """
-        missing column = no secondary likelihoods at all for this event.
-        all = 1
-        """
+        assert cnt > 1, 'passed \'exlikes\' but there are no complex events'
         
+
+        def get_cplx_df(df, aep=None, exp_l=None): #retrieve complex data helper
+            if exp_l is None:
+                exp_l = cplx_evn_d[aep]
+            return df.loc[:, df.columns.isin(exp_l)]
+            
+        #=======================================================================
+        # check we dont already exceed 1
+        #=======================================================================
+        valid = True
+        for aep, exp_l in cplx_evn_d.items():
+            cplx_df = get_cplx_df(edf, exp_l=exp_l) #get data for this event
+            boolidx = cplx_df.sum(axis=1).round(self.prec)>1.0 #find those exceeding 1.0
+
+            if boolidx.any():
+                valid = False
+                rpt_df = cplx_df[boolidx].join(
+                    cplx_df[boolidx].sum(axis=1).rename('sum'))
+                log.debug('aep%.4f: \n\n%s'%(aep, rpt_df))
+                log.error('aep%.4f w/ %i exEvents failed %i (of %i) Psum<1 checks (Pmax=%.2f).. see logger \n    %s'%(
+                    aep, len(exp_l), boolidx.sum(), len(boolidx),cplx_df.sum(axis=1).max(), exp_l))
+                
+        assert valid, 'some complex event probabilities exceed 1'
+            
+        #=======================================================================
+        # #identify those events that need filling
+        #=======================================================================
+        fill_exn_d = dict()
+        for aep, exn_l in cplx_evn_d.items(): 
+            
+            miss_l = set(exn_l).difference(edf.columns)
+            assert len(miss_l)<2, 'can only fill one exposure column per complex event: %s'%miss_l
+            
+            if len(miss_l)==1:
+                fill_exn_d[aep] = list(miss_l)[0]
+            elif len(miss_l)==0:
+                pass #not filling any events
+            else: raise Error('only allowed 1 empty')
+
+                
+        log.debug('calculating probaility for %i complex events with remaining secnodaries'%(
+            len(fill_exn_d)))
+            
+        self.noFailExn_d =copy.copy(fill_exn_d) #set this for the probability calcs
+        
+        #assemble event type  frame
+        """this is a late add.. would have been nice to use this more in multi_ev"""
+        df = aep_ser.to_frame().reset_index(drop=False).rename(columns={'index':'rEventName'})
+        df['noFail'] = df['rEventName'].isin(fill_exn_d.values())
+        
+        self.eventType_df = df
+ 
+        
+        #=======================================================================
+        # fill in missing 
+        #=======================================================================
+        res_d = dict()
+        for aep, exn_miss in fill_exn_d.items():
+            """typically this is a single column generated for the failure raster
+                but this should work for multiple failure rasters"""
+            #===================================================================
+            # legacy method
+            #===================================================================
+            if self.event_rels == 'max':
+                edf[exn_miss]=1
+                
+            #===================================================================
+            # rational (sum to 1)
+            #===================================================================
+            else:
+
+                #data provided on this event
+                cplx_df = get_cplx_df(edf, aep=aep)
+                assert len(cplx_df.columns)==(len(cplx_evn_d[aep])-1), 'bad column count'
+                assert (cplx_df.sum(axis=1)<=1).all() #check we don't already exceed 1 (redundant)
+                
+                #set remainder values
+                edf[exn_miss] = 1- cplx_df.sum(axis=1)
+                
+                log.debug('for aep %.4f \'%s\' set %i remainder values (mean=%.4f)'%(
+                    aep, exn_miss, len(cplx_df), edf[exn_miss].mean()))
+                
+            res_d[exn_miss] = round(edf[exn_miss].mean(), self.prec)
+            
+        if len(res_d)>0: log.info(
+            'set %i complex event conditional probabilities using remainders \n    %s'%(
+                len(res_d), res_d))
+ 
+
+        """NO! probabilities must sum to 1
+        missing column = no secondary likelihoods at all for this event.
+        all probabilities = 1
+        
+        #identify those missing in the edf (compared with the expos)
         miss_l = set(self.expcols).difference(edf.columns)
+        
+        #add 1.0 for any missing
         if len(miss_l) > 0:
             
-            log.info('passed exlikes missing %i secondary exposure likelihoods... treating these as 1\n    %s'%(
+            log.info('\'exlikes\' missing %i events... setting to 1.0\n    %s'%(
                 len(miss_l), miss_l))
             
             for coln in miss_l:
-                edf[coln] = 1.0
+                edf[coln] = 1.0"""
             
+        log.debug('prepared edf w/ %s'%str(edf.shape))
         
-    
-        log.info('prepared edf w/ %s'%str(edf.shape))
-        
-        #==================================================================
-        # check it
-        #==================================================================
 
+        #=======================================================================
+        # #check conditional probabilities sum to 1----
+        #=======================================================================
+
+        valid = True
+        for aep, exp_l in cplx_evn_d.items():
+            cplx_df = get_cplx_df(edf, exp_l=exp_l) #get data for this event
+            boolidx = cplx_df.sum(axis=1)!=1.0 #find those exceeding 1.0
         
-        #set it
+
+
+            if boolidx.any():
+                """allowing this to mass when event_rels=max"""
+                valid = False
+                log.warning('aep%.4f failed %i (of %i) Psum<=1 checks (Pmax=%.2f)'%(
+                    aep, boolidx.sum(), len(boolidx), cplx_df.sum(axis=1).max()))
+        
+        if not self.event_rels == 'max':
+            assert valid, 'some complex event probabilities exceed 1'
+
+        #==================================================================
+        # wrap
+        #==================================================================
         self.data_d[dtag] = edf
+        self.cplx_evn_d = cplx_evn_d
+        
+        return
         
     def load_gels(self,#loading expo data
                    fp = None,
@@ -783,6 +1159,10 @@ class Model(ComWrkr):
         if fp is None: fp = getattr(self, dtag)
         cid = self.cid
         
+        #=======================================================================
+        # prechecks
+        #=======================================================================
+        
         assert 'finv' in self.data_d, 'call load_finv first'
         assert 'evals' in self.data_d, 'call load_evals first'
         assert isinstance(self.expcols, pd.Index), 'bad expcols'
@@ -805,33 +1185,33 @@ class Model(ComWrkr):
         # clean it
         #======================================================================
         df = df_raw.copy()
+        
         #drop dmg suffix
+        """2021-01-13: dropped the _dmg suffix during dmg2.run()
+        left this cleaning for backwards compatailibity"""
         boolcol = df.columns.str.endswith('_dmg')
         enm_l = df.columns[boolcol].str.replace('_dmg', '').tolist()
         
-        #rename these
         ren_d = dict(zip(df.columns[boolcol].values, enm_l))
         df = df.rename(columns=ren_d)
         
-        
+        #set new index
         df = df.set_index(cid, drop=True).sort_index(axis=0)
         
+        #apply rounding
         df = df.round(self.prec)
         
         #======================================================================
         # postcheck
         #======================================================================
-        assert len(enm_l) > 1, 'failed to identify sufficient damage columns'
+        #assert len(enm_l) > 1, 'failed to identify sufficient damage columns'
         
 
         #check cid index match
         assert np.array_equal(self.cindex, df.index), \
             'provided \'%s\' index (%i) does not match finv index (%i)'%(dtag, len(df), len(self.cindex))
         
-        #check events
-        """
-        must match the aeps
-        """
+        #check rEvents
         miss_l = set(self.expcols).difference(df.columns)
             
         assert len(miss_l) == 0, '%i events on \'%s\' not found in aep_ser: \n    %s'%(
@@ -857,7 +1237,89 @@ class Model(ComWrkr):
         self.data_d[dtag] = df
         
         log.info('finished loading %s as %s'%(dtag, str(df.shape)))
-    
+        
+        self.asset_cnt=len(df) #for plotting
+
+    def load_attrimat(self,
+                      dxcol_lvls=2, #levels present in passed data
+                      fp=None,
+                      dtag=None,
+                      check_psum=True,
+                      logger=None): #load the attributino matrix
+        
+        """
+        this data file is built by dmg2.get_attribution()
+        loader is called by:
+            risk1
+            risk2
+        """
+        
+        #=======================================================================
+        # defaults
+        #=======================================================================
+        if logger is None: logger=self.logger
+        log = logger.getChild('load_attrimat')
+        if dtag is None: dtag = self.attrdtag_in
+        if fp is None: fp = getattr(self, dtag)
+        cid = self.cid
+        
+        
+        #=======================================================================
+        # prechecks
+        #=======================================================================
+        assert self.attriMode
+        #assert 'dmgs' in self.data_d, 'dmgs data set required with attrimat'
+        assert os.path.exists(fp), '%s got invalid filepath \n    %s'%(dtag, fp)
+        
+        #assert isinstance(self.expcols, pd.Index), 'bad expcols'
+        #assert isinstance(self.cindex, pd.Index), 'bad cindex'
+
+        #======================================================================
+        # load it
+        #======================================================================
+        dxcol = pd.read_csv(fp, index_col=0, header=list(range(0,dxcol_lvls)))
+        
+        #build the name:rank keys
+        nameRank_d = {lvlName:i for i, lvlName in enumerate(dxcol.columns.names)}
+        
+        #=======================================================================
+        # data precheck
+        #=======================================================================
+        #index checks
+        if hasattr(self, 'cindex'): 
+            assert dxcol.index.name==cid, 'bad index name %s'%(dxcol.index.name)
+            assert np.array_equal(dxcol.index, self.cindex), 'attrimat index mismatch'
+        
+        #dxcolumn check
+        """leaving the column labels flexible
+        risk models (dxcol_lvls=2) should get mdexcol lvl0 name = 'rEventName'
+        as the matrix grows, the position of this name should change"""
+        assert 'rEventName' in dxcol.columns.names,'missing rEventName from coldex'
+
+        #check the rEventNames     
+        if hasattr(self, 'expcols'):  
+            miss_l = set(dxcol.columns.get_level_values(nameRank_d['rEventName'])
+                         ).symmetric_difference(self.expcols)
+            assert len(miss_l)==0, 'attimat rEventName mismatch: %s'%miss_l
+        
+        #check dtypes
+        for e in dxcol.dtypes.values: assert e==np.dtype(float)
+        
+        
+        #=======================================================================
+        # check psum
+        #=======================================================================
+        if check_psum:
+            self.check_attrimat(atr_dxcol = dxcol)
+        
+        #=======================================================================
+        # set
+        #=======================================================================
+        self.data_d[dtag] = dxcol
+
+        log.info('finished loading %s as %s'%(dtag, str(dxcol.shape)))
+  
+        
    
     def add_gels(self): #add gels to finv (that's heights)
         log = self.logger.getChild('add_gels')
@@ -1189,227 +1651,474 @@ class Model(ComWrkr):
         self.ddf = ddf
         
 
+    #===========================================================================
+    # CALCULATORS-------
+    #===========================================================================
         
-        
-    def resolve_multis(self, #selecting maximum expected value for repeat events
-                       ddf, #damages per event
-                       edf, #secondary liklihoods per event
-                       aep_ser,
-                       logger):
+    def ev_multis(self, #calculate (discrete) expected value from events w/ multiple exposure sets
+           ddf, #damages per exposure set (
+           edf, #secondary liklihoods per exposure set ('exlikes'). see load_exlikes()
+                # nulls were replaced by 0.0 (e.g., asset not provided a secondary probability)
+                # missing colums were replaced by 1.0 (e.g., non-failure events)
+            
+           aep_ser,
+           event_rels=None, #ev calculation method
+                #max:  maximum expected value of impacts per asset from the duplicated events
+                    #resolved damage = max(damage w/o fail, damage w/ fail * fail prob)
+                    #default til 2020-12-30
+                #mutEx: assume each event is mutually exclusive (only one can happen)
+                    #lower bound
+                #indep: assume each event is independent (failure of one does not influence the other)
+                    #upper bound
+           logger=None,
+                       ):
         """
-        selecting maximum expected value for repeat events
         
-        CanFlood selects the maximum expected value of impacts per asset from the duplicated events.
-        e.g. resolved damage = max(damage w/o fail, damage w/ fail * fail prob)
+        we accept multiple exposure sets for a single event  
+            e.g. 'failure' raster and 'no fail'
+            
+            where each exposure set is assigned a conditional probability in 'exlikes' (edf)
+                e.g. exlikes=1.0  means only one exposure set
         
         
-        we accept multiple exposure sets for a single event likelihood (
-        e.g. 'failure' raster and 'no fail').
-        Each event can be assigned conditional probabilities in the edf
+        for resolving conditional probabilities for a single exposure set:
+            see build.lisamp.LikeSampler.run()
+            (no impacts)
         
+        view(edf)
+        """
+        #======================================================================
+        # defaults
+        #======================================================================
+        if logger is None: logger=self.logger
+        log = logger.getChild('ev_multis')
+        cplx_evn_d = self.cplx_evn_d #{aep: [eventName1, eventName2,...]}
+        if event_rels is None: event_rels = self.event_rels
 
-        """
-        #======================================================================
-        # setup
-        #======================================================================
-        log = logger.getChild('resolve_multis')
-        
         #======================================================================
         # precheck
         #======================================================================
-        aep_ser = aep_ser.astype(float)
+        assert isinstance(cplx_evn_d, dict)
+        assert len(cplx_evn_d)>0
+        assert (edf.max(axis=1)<=1).all(), 'got probs exceeding 1'
+        assert (edf.min(axis=1)>=0).all(), 'got negative probs'
         
-        if len(aep_ser.unique()) == len(aep_ser):
-            raise Error('resolving multi but there are no duplicated events')
-        
-
-        #======================================================================
-        # get expected values of all damages
-        #======================================================================
         assert ddf.shape == edf.shape, 'shape mismatch'
         """where edf > 0 ddf should also be > 0
         but leave this check for the input validator"""
+        #======================================================================
+        # get expected values of all damages
+        #======================================================================
+        """ skip this based on event_rels?"""
         evdf = ddf*edf
         
-        log.info('calculating expected values for %i damages'%evdf.size)
+        log.info('resolving EV w/ %s, %i event sets, and event_rels=\'%s\''%(
+            str(evdf.shape), len(cplx_evn_d), event_rels))
         assert not evdf.isna().any().any()
+        assert evdf.min(axis=1).min()>=0
         #======================================================================
-        # loop by unique aep and resolve
+        # loop by unique aep and resolve-----
         #======================================================================
         res_df = pd.DataFrame(index=evdf.index, columns = aep_ser.unique().tolist())
-        
-        for indxr, aep in enumerate(aep_ser.unique().tolist()):
+        meta_d = dict() 
+        #for indxr, aep in enumerate(aep_ser.unique().tolist()):
+        for indxr, (aep, exn_l) in enumerate(cplx_evn_d.items()):
+            
+            #===================================================================
+            # setup
+            #===================================================================
             self.feedback.setProgress((indxr/len(aep_ser.unique())*80))
             assert isinstance(aep, float)
-            #==================================================================
-            # get these events
-            #==================================================================
-            #find event names at this aep
-            boolar = aep_ser == aep
             
-            #handle by match count
-            if boolar.sum() == 0:
-                raise Error('problem with event matching')
+            if not event_rels=='max':
+                if not (edf.loc[:, exn_l].sum(axis=1).round(self.prec) == 1.0).all():
+ 
+                    raise Error('aep %.4f probabilities fail to sum'%aep)
             
-            #get these event names
-            evn_l = aep_ser.index[boolar].tolist()
+            log.debug('resolving aep %.4f w/ %i event names: %s'%(aep, len(exn_l), exn_l))
             
-            #==================================================================
-            # resolve
-            #==================================================================
-            log.debug('resolving with %i event names: %s'%(len(evn_l), evn_l))
-            #only 1 event.. nothing to resolve
-            if len(evn_l) == 1:
+            """
+            view(self.att_df)
+            """
+            #===================================================================
+            # simple events.. nothing to resolve----
+            #===================================================================
+            if len(exn_l) == 1:
                 """
-                possible if a hazard layer doesn't have a corresponding failure layer
+                where hazard layer doesn't have a corresponding failure layer
                 """
-                log.warning('only got 1 event \'%s\' for aep %.2e'%(
-                    aep_ser.index[boolar].values, aep))
+                res_df.loc[:, aep] =  evdf.loc[:, exn_l].iloc[:, 0]
+                meta_d[aep] = 'simple event'
                 
-                #use these
-                res_df.loc[:, aep] =  evdf.loc[:, evn_l].iloc[:, 0]
+                """no attribution modification required"""
+                
+            #===================================================================
+            # one failure possibility-----
+            #===================================================================
+            elif len(exn_l) == 2:
+                
+                if event_rels == 'max':
+                    """special legacy method... see below"""
+                    res_df.loc[:, aep] = evdf.loc[:, exn_l].max(axis=1)
+                else:
+                    """where we only have one failure event
+                        events are mutually exclusive by default"""
+                    res_df.loc[:, aep] = evdf.loc[:, exn_l].sum(axis=1)
+                    
+
             
-            #multiple events... take maximum
+            #===================================================================
+            # complex events (more than 2 failure event)----
+            #===================================================================
             else:
-                log.info('resolving alternate damages for aep %.2e from %i events: \n    %s'%(
-                    aep, len(evn_l), evn_l))
+
+                """
+                view(edf.loc[:, exn_l])
+                view(ddf.loc[:, exn_l])
+                view(evdf.loc[:, exn_l])
+                """
                 
-                res_df.loc[:, aep] = evdf.loc[:, evn_l].max(axis=1)
+                log.info('resolving alternate damages for aep %.2e from %i events: \n    %s'%(
+                    aep, len(exn_l), exn_l))
+                
+                if event_rels == 'max':
+                    """
+                    matching 2020 function
+                    taking the max EV on each asset
+                        where those rasters w/o exlikes P=1 (see load_exlikes())
+                        
+                    WARNING: this violates probability logic
+                    
+                    """
+                    
+                    res_df.loc[:, aep] = evdf.loc[:, exn_l].max(axis=1)
+                    
+                elif event_rels == 'mutEx':
+                    res_df.loc[:, aep] = evdf.loc[:, exn_l].sum(axis=1)
+
+                elif event_rels == 'indep':
+                    """
+                    NOTE: this is a very slow routine
+                    TODO: parallel processing
+                    """
+                    
+                    #identify those worth calculating
+                    bx = np.logical_and(
+                        (edf.loc[:, exn_l]>0).sum(axis=1)>1, #with multiple real probabilities
+                        ddf.loc[:,exn_l].sum(axis=1).round(self.prec)>0  #with some damages
+                        )
+                    
+                    #build the event type flags
+                    etype_df = pd.Series(index=exn_l, dtype=np.bool, name='mutEx').to_frame()
+
+                    #mark the failure event
+                    etype_df.loc[etype_df.index.isin(self.noFailExn_d.values()), 'mutEx']=True
+                    assert etype_df.iloc[:,0].sum()==1
+
+                    """todo: consider using 'apply'
+                    tricky w/ multiple data frames...."""
+                    log.info('aep %.4f calculating %i (of %i) EVs from %i events w/ indepedence'%(
+                        aep, bx.sum(), len(bx), len(exn_l)))
+                    
+                    #loop and resolve each asset
+                    for cindx, pser in edf.loc[bx, exn_l].iterrows():
+                   
+                        #assemble the prob/consq set for this asset
+                        inde_df = pser.rename('prob').to_frame().join(
+                            ddf.loc[cindx, exn_l].rename('consq').to_frame()
+                            ).join(etype_df)
+                            
+                        #resolve for this asset
+                        res_df.loc[cindx, aep] = self._get_indeEV(inde_df)
+                        
+                    #fill in remainderes
+                    assert res_df.loc[~bx, aep].isna().all()
+                    res_df.loc[~bx, aep] = evdf.loc[~bx, exn_l].max(axis=1)
+                        
+                        
+                        
+                else: raise Error('bad event_rels: %s'%event_rels)
+
                 
             if res_df[aep].isna().any():
-                print('yay')
                 raise Error('got nulls on %s'%aep)
                 
-        #======================================================================
-        # warp
-        #======================================================================
+        #=======================================================================
+        # # check
+        #=======================================================================
+        assert res_df.min(axis=1).min()>=0
         if not res_df.notna().all().all():
             raise Error('got %i nulls'%res_df.isna().sum().sum())
+        #=======================================================================
+        # attribution------
+        #=======================================================================
+        if self.attriMode:
+            atr_dxcol_raw = self.att_df.copy()
+            mdex = atr_dxcol_raw.columns
+            nameRank_d= {lvlName:i for i, lvlName in enumerate(mdex.names)}
+            edf = edf.sort_index(axis=1, ascending=False)
+            """
+            view(edf)
+            view(atr_dxcol_raw)
+            view(atr_dxcol)
+            view(bool_dxcol)
+            view(mult_dxcol)
+            pd.__version__
+            """
+            if event_rels == 'max':
+                """                
+                turns out we need to get the ACTUAL expected value matrix
+                    here we reconstruct by gettin a max=0, no=1, shared=0.5 matrix
+                    then mutiplyling that by the evdf to get the ACTUAL ev matrix"""
+                
+                #===============================================================
+                # build multipler (boolean based on max)
+                #===============================================================
+                mbdxcol=None
+                for aep, gdf in atr_dxcol_raw.groupby(level=0, axis=1):
+                    #get events on this aep
+                    exn_l = gdf.columns.remove_unused_levels().levels[nameRank_d['rEventName']]
+                    
+                    #identify maximums
+                    booldf = evdf.loc[:, exn_l].isin(evdf.loc[:, exn_l].max(axis=1)).astype(int)
+                    
+                    #handle duplicates (assign equal portion)
+                    if len(exn_l)>1:
+                        boolidx =  booldf.eq(booldf.iloc[:,0], axis=0).all(axis=1)
+                        booldf.loc[boolidx, :] = float(1/len(exn_l))
+
+                    #add in the dummy lvl0 aep
+                    bdxcol = pd.concat([booldf], keys=[aep], axis=1)
+
+                    if mbdxcol is None:
+                        mbdxcol = bdxcol
+                    else:
+                        mbdxcol = mbdxcol.merge(bdxcol, how='outer', left_index=True, right_index=True)
+                        
+                    log.debug('%.4f: got %s'%(aep, str(mbdxcol.shape)))
+                    
+                #check it
+                self.check_attrimat(atr_dxcol=mbdxcol, logger=log)
+
+
+                #===============================================================
+                # apply multiplication
+                #===============================================================
+                #get EV from this
+                evdf1 = mbdxcol.multiply(evdf, axis='column', level=1).droplevel(level=0, axis=1)
+                
+
+                    
+            elif event_rels=='mutEx':
+ 
+                evdf1=evdf
+
+            elif event_rels=='indep':
+                raise Error('not implemented')
+            else: raise Error('bad evnet-Rels')
+            
+            #===================================================================
+            # common
+            #===================================================================
+            #multiply thorugh to get all the expected value components 
+            i_dxcol = atr_dxcol_raw.multiply(evdf1, axis='columns', level=1)
+                
+            #divide by the event totals to get ratios back
+            atr_dxcol = i_dxcol.divide(res_df, axis='columns', level='aep')
+            
+            #apportion null values
+            atr_dxcol = self._attriM_nulls(res_df, atr_dxcol, logger=log)
+            
+            self.att_df = atr_dxcol
+        #======================================================================
+        # wrap
+        #======================================================================
+
         
         log.info('resolved to %i unique event damages'%len(res_df.columns))
         
         return res_df.sort_index(axis=1)
     
-    #==========================================================================
-    # validators-----------
-    #==========================================================================
-    
-    def check_monot(self,
-                     df_raw, #event:asset like data. expectes columns as aep 
-                     split_key = False, #optional key to split hazard columns with (for fail/noFail sets)
-                     aep_ser=None, event_probs = 'aep', #optional kwargs for column conversion
-                     logger=None
+    def _attriM_nulls(self, #handle nulls in an attribution matrix
+                     idf, #impact values (of which we are calculating attributions)
+                     aRaw_dxcol, #attribution matrix w/ nulls (that need filling)
+                     logger=None,
+                     
                      ):
-        """
-        if damages are equal the warning will be thrown
-        
-        todo: store this as an output
-        """
         
         
-        #======================================================================
+        #=======================================================================
         # defaults
-        #======================================================================
-        
+        #=======================================================================
         if logger is None: logger=self.logger
-        if split_key is None: split_key = self.split_key
-        log = logger.getChild('check_monot')
+        log=logger.getChild('_attriM_nulls')
+        mdex = aRaw_dxcol.columns
+        nameRank_d= {lvlName:i for i, lvlName in enumerate(mdex.names)}
         
-        #======================================================================
-        # worker func
-        #======================================================================
-        def chk_func(df_raw, log):
+        #=======================================================================
+        # prechecks
+        #=======================================================================
+        assert np.array_equal(mdex.levels[0], idf.columns), 'impacts and top level dont match'
+        #=======================================================================
+        # zero damage for event across set: equal attribution---
+        #=======================================================================
+        #=======================================================================
+        # #builld replacement locator frame
+        #=======================================================================
+        booldxcol = idf==0.0  #elements w/ zero impact
         
-            #======================================================================
-            # convresions
-            #======================================================================
-            if not aep_ser is None:
-                df, d = self.conv_expo_aep(df_raw, aep_ser, event_probs=event_probs, logger=log)
-            else:
-                df = df_raw.copy()
-            
-            log.debug('on %s w/ cols: \n    %s'%(str(df.shape), df.columns.tolist()))
-            #======================================================================
-            # prechecks
-            #======================================================================
-            
-            assert np.issubdtype(df.columns.dtype, np.number)
-            """should be ok
-            assert np.all(df.notna()), 'got some nulls'"""
-            assert df.columns.is_monotonic_increasing #extreme to likely
-            assert df.columns.max() <1
-            
-            #======================================================================
-            # clean
-            #======================================================================
-            if df.isna().any().any():
-                log.warning('replacing %i nulls w/ zeros for check'%df.isna().sum().sum())
-                df = df.fillna(0).copy()
-                
-            #======================================================================
-            # check
-            #======================================================================
-            """
-                    #apply the ead func
-            df.loc[boolidx, 'ead'] = df.loc[boolidx, :].apply(
-                self.get_ev, axis=1, dx=dx)
-            """
-            def chk_func(ser):
-                return ser.is_monotonic_decreasing
+        booldxcol.columns.names=[mdex.names[0]]
+        """not very elegant"""
         
-            #check for damage monotonicity (should go from left BIG/extreme to right small/likely
-            """
-            view(df)
-            view(df[boolidx])
-            """
-            #get offenders (from 
-            boolidx = np.logical_and(
-                ~df.apply(chk_func, axis=1), #NOT going left big to righ textreme
-                df.nunique(axis=1) > 1, #only one value per row
-                )
-    
-            if boolidx.any():
-                with pd.option_context(
-                                'display.max_rows', None, 
-                               'display.max_columns', None,
-                               #'display.height',1000,
-                               'display.width',1000):
-                        
-                    log.debug('\n%s'%df.loc[boolidx, :])
-                    log.debug('\n%s'%df[boolidx].index.tolist())
-                    log.warning(' %i (of %i)  assets have non-monotonic-increasing damages. see logger'%(
-                        boolidx.sum(), len(boolidx)))
-                
-                return False
-            else:
-                log.debug('all %i passed'%len(df))
-                return True
-        
-        #======================================================================
-        # splitting
-        #======================================================================
-        if not split_key == False:
-            boolcol = df_raw.columns.str.contains(split_key)
+        #propagate boolean values into dxcol
+        for lRank, lvlName in enumerate(mdex.names):
+            if lRank==0: continue #always skipping top level
             
-            if not boolcol.any():
-                raise Error('failed to split events by \"%s\''%split_key)
+            lvals = mdex.levels[lRank].tolist() 
             
-            res1 = chk_func(df_raw.loc[:,boolcol], log.getChild(split_key))
-            res2 = chk_func(df_raw.loc[:,~boolcol], log.getChild('no%s'%split_key))
-            
-            result = res1 and res2
-            
-        else:
-            result= chk_func(df_raw, log)
-            
-        return result
-            
+            #propagate into this level
+            booldxcol = pd.concat([booldxcol]*len(lvals), keys=lvals, axis=1,
+                                  names=[lvlName]+booldxcol.columns.names
+                                  )
+        #re-order
+        booldxcol = booldxcol.reorder_levels(mdex.names, axis=1)
+        booldxcol = booldxcol.reindex(aRaw_dxcol.columns, axis=1)
+        assert np.array_equal(booldxcol.columns, aRaw_dxcol.columns)
+        """
+        view(booldxcol)
+        view(aRaw_dxcol)
+        view(atr_dxcol)
+        """
+        #=======================================================================
+        # #apply locator frame
+        #=======================================================================
 
-    def calc_ead(self,
+        #loop through each of the top-level values and figure out the set size
+        fv_d = dict()
+        dxcol = None
+        for lval, gdf in aRaw_dxcol.groupby(level=0, axis=1):
+            fv_d[lval] = 1/len(gdf.columns)
+            booldf = booldxcol.loc[:, idx[lval,:,:]]
+            
+            gdxcol = gdf.where(~booldf, other=fv_d[lval])
+            
+            if dxcol is None:
+                dxcol = gdxcol
+            else:
+                dxcol = dxcol.join(gdxcol) 
+            
+            log.debug('l0=%s. setting %i (of %i) full dmg=0 entries with equal attribution = %.2f'%(
+                lval, booldf.sum().sum(), booldf.size, fv_d[lval]))
+        
+        #=======================================================================
+        # remaining partial zero damage nests
+        #=======================================================================
+        log.debug('setting %i (of %i) partial dmg=0 entries w/ 0.0 attribution'%(
+            dxcol.isna().sum().sum(), dxcol.size))
+        
+        dxcol = dxcol.fillna(0.0)
+        
+        #=======================================================================
+        # checks
+        #=======================================================================
+        if not dxcol.notna().all().all():
+            raise Error('got %i (of %i) remaining nulls after filling'%(
+                dxcol.isna().sum().sum(), dxcol.size))
+            
+        self.check_attrimat(atr_dxcol=dxcol, logger=log)
+        
+        return dxcol
+    
+    def _get_indeEV(self,
+                    inde_df #prob, consq, mutual exclusivity flag for each exposure event 
+                    ):
+        
+        """
+        get the expected value at an asset with 
+            n>1 indepednet failure events (w/ probabilities)
+            and 1 noFail event
+        """
+        
+        #=======================================================================
+        # prechecks  
+        #=======================================================================
+        #check the columns
+        miss_l = set(['prob', 'consq', 'mutEx']).symmetric_difference(inde_df.columns)
+        assert len(miss_l)==0
+        
+        #=======================================================================
+        # failures---------
+        #=======================================================================
+        bxf = ~inde_df['mutEx']
+        #=======================================================================
+        # assemble complete scenario matrix
+        #=======================================================================
+        n = len(inde_df[bxf])
+        
+        #build it
+        if not n in self.scen_ar_d:
+            scenFail_ar = np.array([i for i in itertools.product(['yes','no'], repeat=n)])
+            self.scen_ar_d[n] = copy.copy(scenFail_ar)
+        
+        #retrieve pre-built
+        else:
+            scenFail_ar = copy.copy(self.scen_ar_d[n])
+
+        
+        #=======================================================================
+        #  probs
+        #=======================================================================
+        sFailP_df = pd.DataFrame(scenFail_ar, columns=inde_df[bxf].index)
+        
+        #expand probabilities to mathc size
+        prob_ar  = np.tile(inde_df.loc[bxf, 'prob'].to_frame().T.values, (len(sFailP_df), 1))
+        
+        #swap in positives
+        sFailP_df = sFailP_df.where(
+            np.invert(sFailP_df=='yes'), 
+            prob_ar, inplace=False)
+        
+        #swap in negatives
+        sFailP_df = sFailP_df.where(
+            np.invert(sFailP_df=='no'), 
+            1-prob_ar, inplace=False).astype(np.float64)
+        
+        #combine
+        sFailP_df['pTotal'] = sFailP_df.prod(axis=1)
+        assert round(sFailP_df['pTotal'].sum(), self.prec)==1, inde_df
+        
+        #=======================================================================
+        # consequences
+        #=======================================================================
+        sFailC_df = pd.DataFrame(scenFail_ar, columns=inde_df[bxf].index).replace(
+            {'yes':1.0, 'no':0.0}).astype(np.float64)
+        
+        #add in consequences
+        sFailC_df = sFailC_df.multiply(inde_df.loc[bxf, 'consq'])
+        
+        #get maximums
+        sFailC_df['cTotal'] = sFailC_df.max(axis=1)
+        
+        #=======================================================================
+        # expected values
+        #=======================================================================
+        evFail_ser = sFailP_df['pTotal']*sFailC_df['cTotal']
+        
+        #=======================================================================
+        # total-------
+        #=======================================================================
+        noFail_ar = inde_df.loc[~bxf, ['prob', 'consq']].iloc[0, :].values
+        
+        return evFail_ser.sum() + noFail_ar[0]*noFail_ar[1]
+
+
+
+    def calc_ead(self, #get EAD from a set of impacts per event
                  df_raw, #xid: aep
                  ltail = None,
                  rtail = None,
                  drop_tails = False, #whether to remove the dummy tail values from results
+                 dx = None, #damage step for integration (default:None)
                  logger = None
                  ):      
         
@@ -1447,6 +2156,7 @@ class Model(ComWrkr):
                 ltail  = float(ltail)
             except Exception as e:
                 raise Error('failed to convert \'ltail\'=\'%s\' to numeric \n    %s'%(ltail, e))
+            
         if not rtail in ['extrapolate', 'none']:
             rtail = float(rtail)
             
@@ -1458,7 +2168,7 @@ class Model(ComWrkr):
         
         assert bx.any(), 'no valid results on %s'%str(df_raw.shape)
         #=======================================================================
-        # get tail parameters-----
+        # get tail values-----
         #=======================================================================
         #======================================================================
         # left tail
@@ -1468,17 +2178,27 @@ class Model(ComWrkr):
         if ltail == 'flat':
             df.loc[:,0] = df.iloc[:,0] 
             
-        elif ltail == 'extrapolate':
-            df.loc[bx,0] = df.loc[bx, :].apply(self.extrap, axis=1, left=True)
-
+            if len(df)==1: 
+                self.extrap_vals_d[0] = df.loc[:,0].mean().round(self.prec) #store for later
+            
+        elif ltail == 'extrapolate': #DEFAULT
+            df.loc[bx,0] = df.loc[bx, :].apply(self._extrap_rCurve, axis=1, left=True)
+            
+            #extrap vqalue will be different for each entry
+            if len(df)==1: 
+                self.extrap_vals_d[0] = df.loc[:,0].mean().round(self.prec) #store for later
 
         elif isinstance(ltail, float):
             """this cant be a good idea...."""
             df.loc[bx,0] = ltail
+            
+            self.extrap_vals_d[0] = ltail #store for later
+            
         elif ltail == 'none':
             pass
         else:
             raise Error('unexected ltail key'%ltail)
+        
         
         #======================================================================
         # right tail
@@ -1487,7 +2207,7 @@ class Model(ComWrkr):
             """just using the average for now...
             could extraploate for each asset but need an alternate method"""
             aep_ser = df.loc[bx, :].apply(
-                self.extrap, axis=1, left=False)
+                self._extrap_rCurve, axis=1, left=False)
             
             aep_val = round(aep_ser.mean(), 5)
             
@@ -1497,8 +2217,12 @@ class Model(ComWrkr):
             
             log.info('using right intersection of aep= %.2e from average extraploation'%(
                 aep_val))
+            
+            
+            self.extrap_vals_d[aep_val] = 0 #store for later 
+            
         
-        elif isinstance(rtail, float):
+        elif isinstance(rtail, float): #DEFAULT
             aep_val = round(rtail, 5)
             assert aep_val > df.columns.max(), 'passed rtail value (%.2f) not > max aep (%.2f)'%(
                 aep_val, df.columns.max())
@@ -1508,17 +2232,24 @@ class Model(ComWrkr):
             log.debug('setting ZeroDamage event from user passed \'rtail\' aep=%.7f'%(
                 aep_val))
             
-        elif rtail == 'none':
+            self.extrap_vals_d[aep_val] = 0 #store for later 
+
+        elif rtail == 'flat':
             #set the zero damage year as the lowest year in the model (with a small buffer) 
             aep_val = max(df.columns.tolist())*(1+10**-(self.prec+2))
             df.loc[bx, aep_val] = 0
             
-            log.info('rtail=\'none\' setting ZeroDamage event as aep=%.7f'%aep_val)
+            log.info('rtail=\'flat\' setting ZeroDamage event as aep=%.7f'%aep_val)
+            
+        elif rtail == 'none':
+            log.warning('no rtail extrapolation specified! leads to invalid integration bounds!')
         
         else:
             raise Error('unexpected rtail %s'%rtail)
             
         df = df.sort_index(axis=1)
+        
+        
 
         #======================================================================
         # check monoticiy again
@@ -1535,14 +2266,16 @@ class Model(ComWrkr):
         #======================================================================
         #get reasonable dx (integration step along damage axis)
         """todo: allow the user to set t his"""
-        dx = df.max().max()/100
+        if dx is None:
+            dx = df.max().max()/100
+        assert isinstance(dx, float)
         
         #re-arrange columns so x is ascending
         df = df.sort_index(ascending=False, axis=1)
         
         #apply the ead func
         df.loc[bx, 'ead'] = df.loc[bx, :].apply(
-            self.get_ev, axis=1, dx=dx)
+            self._get_ev, axis=1, dx=dx)
         
         
         df.loc[:, 'ead'] = df['ead'].fillna(0) #fill remander w/ zeros
@@ -1558,17 +2291,18 @@ class Model(ComWrkr):
         # clean results
         #======================================================================
         if drop_tails:
-            """not sure about this"""
+            #just add the results values onto the raw
             res_df = df_raw.join(df['ead'])
         else:
+            #take everything
             res_df = df
             
         return res_df.round(self.prec)
 
 
-    def extrap(self,  #extraploating EAD curve data
+    def _extrap_rCurve(self,  #extraploating EAD curve data
                ser, #row of dmages (y values) from big df
-               left=True, #whether to extraploate left or gihtt
+               left=True, #whether to extraploate left or right
                ):
         
         """
@@ -1619,7 +2353,7 @@ class Model(ComWrkr):
         
         return float(result) 
     
-    def get_ev(self, #integration caller
+    def _get_ev(self, #integration caller
                ser, #row from damage results
                dx = 0.1,
                ):
@@ -1680,394 +2414,14 @@ class Model(ComWrkr):
 
         return round(ead_tot, self.prec)
     
-    def risk_plot(self, #generate and save a figure that summarizes the damages 
-                  dmg_ser = None,
-                  
-                  #labels
-                  xlab='ARI', y1lab=None, y2lab='AEP',
-                  
-                  #format controls
-                  grid = True, logx = False, 
-                  basev = 1, #base value for dividing damage values
-                  dfmt = None, #formatting of damage values 
-                  
-                  
-                  #figure parametrs
-                figsize     = (6.5, 4), 
-                    
-                #hatch pars
-                    hatch =  None,
-                    h_color = 'blue',
-                    h_alpha = 0.1,
-                  ):
-        
-
-        
-        #======================================================================
-        # defaults
-        #======================================================================
-        log = self.logger.getChild('risk_plot')
-        if dmg_ser is None: dmg_ser = self.res_ser.copy()
-        if dfmt is None: dfmt = self.plot_fmt
-        if y1lab is None: y1lab = self.y1lab
-        #======================================================================
-        # precheck
-        #======================================================================
-        assert isinstance(dmg_ser, pd.Series)
-        assert 'ead' in dmg_ser.index, 'dmg_ser missing ead index'
-        #======================================================================
-        # setup
-        #======================================================================
-        """todo: move this up"""
-        import matplotlib
-        matplotlib.use('Qt5Agg') #sets the backend (case sensitive)
-        import matplotlib.pyplot as plt
-        
-        #set teh styles
-        plt.style.use('default')
-        
-        #font
-        matplotlib_font = {
-                'family' : 'serif',
-                'weight' : 'normal',
-                'size'   : 8}
-        
-        matplotlib.rc('font', **matplotlib_font)
-        matplotlib.rcParams['axes.titlesize'] = 10 #set the figure title size
-        
-        #spacing parameters
-        matplotlib.rcParams['figure.autolayout'] = False #use tight layout
-        
-        #======================================================================
-        # data manipulations
-        #======================================================================
-        #get ead
-        ead_tot, dmg_ser1 = self.fmt_dmg_plot(dmg_ser)
-                
-        
-        #get aep series
-        aep_ser = dmg_ser1.copy()
-        aep_ser.loc[:] = 1/dmg_ser1.index
-        
-        
-        #======================================================================
-        # labels
-        #======================================================================\
-        
-        val_str = 'annualized impacts = %s \nltail=\"%s\',  rtail=\'%s\''%(
-            dfmt.format(ead_tot/basev), self.ltail, self.rtail)
-        
-        title = '%s.%s Impact-%s plot on %i events'%(self.name,self.tag, xlab, len(dmg_ser1))
-        
-        #======================================================================
-        # figure setup
-        #======================================================================
-        plt.close()
-        fig = plt.figure(figsize=figsize,
-                     tight_layout=False,
-                     constrained_layout = True,
-                     )
-
-        
-        #axis setup
-        ax1 = fig.add_subplot(111)
-        ax2 = ax1.twinx()
-        ax1.set_xlim(max(aep_ser.index), 1) #aep limits 
-        
-        # axis label setup
-        fig.suptitle(title)
-        ax1.set_ylabel(y1lab)
-        ax2.set_ylabel(y2lab)
-        ax1.set_xlabel(xlab)
-        
-        #======================================================================
-        # fill the plot
-        #======================================================================
-        #damage plot
-        xar,  yar = dmg_ser1.index.values, dmg_ser1.values
-        pline1 = ax1.semilogx(xar,yar,
-                            label       = y1lab,
-                            color       = 'black',
-                            linestyle   = 'dashdot',
-                            linewidth   = 2,
-                            alpha       = 0.5,
-                            marker      = 's',
-                            markersize  = 4,
-                            fillstyle   = 'full', #marker fill style
-                            )
-        
-        #add a hatch
-        polys = ax1.fill_between(xar, yar, y2=0, 
-                                color       = h_color, 
-                                alpha       = h_alpha,
-                                hatch       = hatch)
-        
-        #aep plot
-        xar,  yar = aep_ser.index.values, aep_ser.values
-        pline2 = ax2.semilogx(xar,yar,
-                            label       = y2lab,
-                            color       = 'blue',
-                            linestyle   = 'dashed',
-                            linewidth   = 1,
-                            alpha       = 1,
-                            marker      = 'x',
-                            markersize  = 0,
-                            )
-
-        #=======================================================================
-        # Add text string 'annot' to lower left of plot
-        #=======================================================================
-        xmin, xmax1 = ax1.get_xlim()
-        ymin, ymax1 = ax1.get_ylim()
-        
-        x_text = xmin + (xmax1 - xmin)*.1 # 1/10 to the right of the left ax1is
-        y_text = ymin + (ymax1 - ymin)*.2 #1/10 above the bottom ax1is
-        anno_obj = ax1.text(x_text, y_text, val_str)
-        
-        #=======================================================================
-        # format axis labels
-        #======================================================= ================
-        #damage values (yaxis for ax1)
-        old_tick_l = ax1.get_yticks() #get teh old labels
-         
-        # build the new ticks
-        l = [dfmt.format(value/basev) for value in old_tick_l]
-              
-        #apply the new labels
-        ax1.set_yticklabels(l)
-
-        #ARI (xaxis for ax1)
-        ax1.get_xaxis().set_major_formatter(
-                matplotlib.ticker.FuncFormatter(lambda x, p: format(int(x), ',')))
-        
-        #=======================================================================
-        # post formatting
-        #=======================================================================
-        if grid: 
-            ax1.grid()
-        
-
-        #legend
-        h1, l1 = ax1.get_legend_handles_labels() #pull legend handles from axis 1
-        h2, l2 = ax2.get_legend_handles_labels()
-        ax1.legend(h1+h2, l1+l2, loc=2) #turn legend on with combined handles
-        
-        return fig
-    """
-    plt.show()
-    """
-    
-    def plot_aep(self, #generate and save a figure that summarizes the damages 
-                  dmg_ser = None,
-                  
-                  #labels
-                  y1lab='AEP',   xlab=None, 
-                  
-                  #format controls
-                  grid = True, 
-                  basev = 1, #base value for dividing damage values
-                  dfmt = None, #formatting of damage values 
-                  
-                  
-                  #figure parametrs
-                  figsize     = (6.5, 4), 
-                    
-                    #hatch pars
-                    hatch =  None,
-                    h_color = 'red',
-                    h_alpha = 0.1,
-                    
-                    xlrot = 45, #rotration for xlabels
-                  ):
-        
-
-        
-        #======================================================================
-        # defaults
-        #======================================================================
-        log = self.logger.getChild('plot_aep')
-        if dmg_ser is None: dmg_ser = self.res_ser.copy()
-        if dfmt is None: dfmt = self.plot_fmt
-        if xlab is None: xlab = self.y1lab #pull from risk_plot notation
-
-        #======================================================================
-        # precheck
-        #======================================================================
-        assert isinstance(dmg_ser, pd.Series)
-        assert 'ead' in dmg_ser.index, 'dmg_ser missing ead index'
-        
-        log.info('on %i events \n    %s'%(len(dmg_ser), dmg_ser.to_dict()))
-        #======================================================================
-        # setup
-        #======================================================================
-        
-        import matplotlib
-        matplotlib.use('Qt5Agg') #sets the backend (case sensitive)
-        import matplotlib.pyplot as plt
-        
-        #set teh styles
-        plt.style.use('default')
-        
-        #font
-        matplotlib_font = {
-                'family' : 'serif',
-                'weight' : 'normal',
-                'size'   : 8}
-        
-        matplotlib.rc('font', **matplotlib_font)
-        matplotlib.rcParams['axes.titlesize'] = 10 #set the figure title size
-        
-        #spacing parameters
-        matplotlib.rcParams['figure.autolayout'] = False #use tight layout
-        
-        #======================================================================
-        # data manipulations
-        #======================================================================
-        aep_ser = dmg_ser.drop('ead')
-        ead_tot = dmg_ser['ead']
-                
-        #======================================================================
-        # labels
-        #======================================================================\
-        
-        val_str = 'annualized impacts = %s \nltail=\"%s\',  rtail=\'%s\''%(
-            dfmt.format(ead_tot/basev), self.ltail, self.rtail)
-        
-        title = '%s.%s Impact-%s plot on %i events'%(self.name,self.tag, y1lab, len(aep_ser))
-        
-        #======================================================================
-        # figure setup
-        #======================================================================
-        plt.close()
-        fig = plt.figure(figsize=figsize,
-                     tight_layout=False,
-                     constrained_layout = True,
-                     )
-
-        
-        #axis setup
-        ax1 = fig.add_subplot(111)
-        
-        #aep units
-        ax1.set_xlim(0, max(aep_ser)) #aep limits 
-        ax1.set_ylim(0, max(aep_ser.index)*1.1)
-        
-        """I think we need to use a label formatter instead
-        #ari units
-        ax2 = ax1.twiny()
-        ax2.set_xlabel(x2lab)
-        ax2.set_xlim(99999999, 1/max(aep_ser.index))"""
-        
-        # axis label setup
-        fig.suptitle(title)
-        ax1.set_ylabel(y1lab)
-
-        ax1.set_xlabel(xlab)
-        """
-        plt.close()
-        plt.show()
-        """
-        #======================================================================
-        # fill the plot
-        #======================================================================
-        #damage plot
-        xar,  yar = aep_ser.values.astype(np.float), aep_ser.index.values
-        pline1 = ax1.plot(xar,yar,
-                            label       = y1lab,
-                            color       = 'black',
-                            linestyle   = 'dashdot',
-                            linewidth   = 2,
-                            alpha       = 0.5,
-                            marker      = 's',
-                            markersize  = 4,
-                            fillstyle   = 'full', #marker fill style
-                            )
-        
-        #add a hatch
-
-        polys = ax1.fill_betweenx(yar.astype(np.float), x1=xar, x2=0, 
-                                color       = h_color, 
-                                alpha       = h_alpha,
-                                hatch       = hatch)
-        
-
-
-        #=======================================================================
-        # Add text string 'annot' to lower left of plot
-        #=======================================================================
-        xmin, xmax1 = ax1.get_xlim()
-        ymin, ymax1 = ax1.get_ylim()
-        
-        x_text = xmin + (xmax1 - xmin)*.5 # 1/10 to the right of the left ax1is
-        y_text = ymin + (ymax1 - ymin)*.2 #1/10 above the bottom ax1is
-        anno_obj = ax1.text(x_text, y_text, val_str)
-        
-        #=======================================================================
-        # format axis labels
-        #======================================================= ================
-        #damage values (xaxis)
-        old_tick_l = ax1.get_xticks() #get teh old labels
-         
-        # build the new ticks
-        l = [dfmt.format(value/basev) for value in old_tick_l]
-              
-        #apply the new labels
-        ax1.set_xticklabels(l, rotation=xlrot)
-
-        #=======================================================================
-        # #ARI (xaxis for ax1)
-        # ax1.get_xaxis().set_major_formatter(
-        #         matplotlib.ticker.FuncFormatter(lambda x, p: format(int(x), ',')))
-        #=======================================================================
-        
-        #=======================================================================
-        # post formatting
-        #=======================================================================
-        if grid: 
-            ax1.grid()
-        
-
-        #legend
-        h1, l1 = ax1.get_legend_handles_labels() #pull legend handles from axis 1
-
-        ax1.legend(h1, l1, loc=2) #turn legend on with combined handles
-        
-        return fig
-    """
-    plt.show()
-    """
-    
-    def fmt_dmg_plot(self,#formatting damages for plotting
-                     dmg_ser_raw): 
-        
-        #get ead
-        dmg_ser = dmg_ser_raw.copy()
-        ead_tot = dmg_ser['ead']
-        del dmg_ser['ead'] #remove it from plotter values
-        
-        
-        #get damage series to plot
-        ar = np.array([dmg_ser.index, dmg_ser.values]) #convert to array
-        
-        #invert aep (w/ zero handling)
-        ar[0] = 1/np.where(ar[0]==0, #replaced based on zero value
-                           sorted(ar[0])[1]/10, #dummy value for zero (take the second smallest value and divide by 10)
-                           ar[0]) 
-        
-        dmg_ser1 = pd.Series(ar[1], index=ar[0], dtype=float) #back into series
-        dmg_ser1.index = dmg_ser1.index.astype(int) #format it
-        
-        return ead_tot, dmg_ser1
-        
-    
-    def conv_expo_aep(self, #converting exposure data set to aep column values 
+    def _conv_expo_aep(self, #converting exposure data set to aep column values 
                       df, 
                       aep_ser,
                       event_probs = 'aep',
                       logger = None,):
         
         if logger is None: logger = self.logger
-        log = self.logger.getChild('conv_expo_aep')
+        log = self.logger.getChild('_conv_expo_aep')
         
         assert isinstance(aep_ser, pd.Series)
         
@@ -2102,8 +2456,6 @@ class Model(ComWrkr):
         
         return df1, aep_ser.to_dict()
             
-            
-        
     def force_monot(self, #forcing monotoncity on an exposure data set
                    df_raw,
                    aep_ser = None, #optional aep_ser to format here
@@ -2122,7 +2474,7 @@ class Model(ComWrkr):
         # convresions
         #======================================================================
         if not aep_ser is None:
-            df, d = self.conv_expo_aep(df_raw, aep_ser, event_probs=event_probs, logger=log)
+            df, d = self._conv_expo_aep(df_raw, aep_ser, event_probs=event_probs, logger=log)
             
             #get conversion dict to map it back at the end
 
@@ -2222,55 +2574,640 @@ class Model(ComWrkr):
         
         
         return res_df.rename(columns=rename_d)
+    
+    #===========================================================================
+    # PLOTTING-------
+    #===========================================================================
+    def risk_plot(self, #impacts vs ARI 
+                  dmg_ser = None,
+                  
+                  #labels
+                  xlab='ARI', y1lab=None, y2lab='AEP',
+                  
+                  #format controls
+                  grid = True, logx = False, 
+                  basev = 1, #base value for dividing damage values
+                  dfmt = None, #formatting of damage values 
+                  
+                  
+                  #figure parametrs
+                figsize     = (6.5, 4), 
+                    
+                #hatch pars
+                    hatch =  None,
+                    h_color = 'blue',
+                    h_alpha = 0.1,
+                  ):
         
 
-if __name__ =="__main__":
-    
+        """
+        TODO: harmonize w/ riskPlot()
+        """
+        #======================================================================
+        # defaults
+        #======================================================================
+        log = self.logger.getChild('risk_plot')
+        log.warning('depreciated!!')
+        if dmg_ser is None: dmg_ser = self.res_ser.copy()
+        if dfmt is None: dfmt = self.plot_fmt
+        if y1lab is None: y1lab = self.y1lab
+        #======================================================================
+        # precheck
+        #======================================================================
+        assert isinstance(dmg_ser, pd.Series)
+        assert 'ead' in dmg_ser.index, 'dmg_ser missing ead index'
+        #======================================================================
+        # setup
+        #======================================================================
+        """todo: move this up"""
+        import matplotlib
+        matplotlib.use('Qt5Agg') #sets the backend (case sensitive)
+        import matplotlib.pyplot as plt
+        
+        #set teh styles
+        plt.style.use('default')
+        
+        #font
+        matplotlib_font = {
+                'family' : 'serif',
+                'weight' : 'normal',
+                'size'   : 8}
+        
+        matplotlib.rc('font', **matplotlib_font)
+        matplotlib.rcParams['axes.titlesize'] = 10 #set the figure title size
+        
+        #spacing parameters
+        matplotlib.rcParams['figure.autolayout'] = False #use tight layout
+        
+        #======================================================================
+        # data manipulations
+        #======================================================================
+        #get ead
+        ead_tot, dmg_ser1 = self.fmt_dmg_plot(dmg_ser)
+                
+        
+        #get aep series
+        aep_ser = dmg_ser1.copy()
+        aep_ser.loc[:] = 1/dmg_ser1.index
+        
+        
+        #======================================================================
+        # labels
+        #======================================================================\
+        
+        val_str = 'annualized impacts = %s \nltail=\'%s\',  rtail=\'%s\''%(
+            dfmt.format(ead_tot/basev), self.ltail, self.rtail) + \
+            '\nassets = %i, event_rels = \'%s\', prec = %i'%(
+                self.asset_cnt, self.event_rels, self.prec)
+        
+        title = '%s.%s Impact-%s plot on %i events'%(self.name,self.tag, xlab, len(dmg_ser1))
+        
+        #======================================================================
+        # figure setup
+        #======================================================================
+        plt.close()
+        fig = plt.figure(figsize=figsize,
+                     tight_layout=False,
+                     constrained_layout = True,
+                     )
 
-    """checking monotonocity
-    #==========================================================================
-    # chekc failure events
-    #==========================================================================
-    log = mod_logger.getChild('fail')
-    log.info('testing failures')
-    boolcol = ddf_raw.columns.str.contains('fail')
-    
-    assert boolcol.sum() <= len(ddf_raw.columns)/2
-     
-    ddf = ddf_raw.loc[:, boolcol]
-    aep_ser = adf.iloc[0, adf.columns.isin(ddf.columns)].astype(int).sort_values().copy()
-      
-  
-    wrkr.check_monot(ddf, aep_ser, logger=log)
-    
-    
-    #==========================================================================
-    # check normal events
-    #==========================================================================
-    log = mod_logger.getChild('norm')
-    log.info('testing normal events')
-    ddf = ddf_raw.loc[:, ~boolcol]
-    aep_ser = adf.iloc[0, adf.columns.isin(ddf.columns)].astype(int).sort_values()
-    
-    wrkr.check_monot(ddf, aep_ser, logger=log)
-    
-    
-    #==========================================================================
-    # check exlikes
-    #==========================================================================
-    exdf = pd.read_csv(exl_fp).set_index(cid)
-    aep_ser = adf.iloc[0, adf.columns.isin(exdf.columns)].astype(int).sort_values()
-     
-    wrkr.check_monot(exdf, aep_ser, logger=log)
+        
+        #axis setup
+        ax1 = fig.add_subplot(111)
+        ax2 = ax1.twinx()
+        ax1.set_xlim(max(aep_ser.index), 1) #aep limits 
+        
+        # axis label setup
+        fig.suptitle(title)
+        ax1.set_ylabel(y1lab)
+        ax2.set_ylabel(y2lab)
+        ax1.set_xlabel(xlab)
+        
+        #======================================================================
+        # fill the plot
+        #======================================================================
+        #damage plot
+        xar,  yar = dmg_ser1.index.values, dmg_ser1.values
+        pline1 = ax1.semilogx(xar,yar,
+                            label       = y1lab,
+                            color       = self.color,
+                            linestyle   = self.linestyle,
+                            linewidth   = self.linewidth,
+                            alpha       = self.alpha,
+                            marker      = self.marker,
+                            markersize  = self.markersize,
+                            fillstyle   = self.fillstyle, #marker fill style
+                            )
+        
+        #add a hatch
+        polys = ax1.fill_between(xar, yar, y2=0, 
+                                color       = h_color, 
+                                alpha       = h_alpha,
+                                hatch       = hatch)
+        
+        #aep plot
+        xar,  yar = aep_ser.index.values, aep_ser.values
+        pline2 = ax2.semilogx(xar,yar,
+                            label       = y2lab,
+                            color       = 'blue',
+                            linestyle   = 'dashed',
+                            linewidth   = 1,
+                            alpha       = 1,
+                            marker      = 'x',
+                            markersize  = 0,
+                            )
+
+        #=======================================================================
+        # Add text string 'annot' to lower left of plot
+        #=======================================================================
+        xmin, xmax1 = ax1.get_xlim()
+        ymin, ymax1 = ax1.get_ylim()
+        
+        x_text = xmin + (xmax1 - xmin)*.1 # 1/10 to the right of the left ax1is
+        y_text = ymin + (ymax1 - ymin)*.2 #1/10 above the bottom ax1is
+        anno_obj = ax1.text(x_text, y_text, val_str)
+        
+        #=======================================================================
+        # format axis labels
+        #======================================================= ================
+        #damage values (yaxis for ax1)
+        old_tick_l = ax1.get_yticks() #get teh old labels
+         
+        # build the new ticks
+        l = [dfmt.format(value/basev) for value in old_tick_l]
+              
+        #apply the new labels
+        ax1.set_yticklabels(l)
+
+        #ARI (xaxis for ax1)
+        ax1.get_xaxis().set_major_formatter(
+                matplotlib.ticker.FuncFormatter(lambda x, p: format(int(x), ',')))
+        
+        #=======================================================================
+        # post formatting
+        #=======================================================================
+        if grid: 
+            ax1.grid()
+        
+
+        #legend
+        h1, l1 = ax1.get_legend_handles_labels() #pull legend handles from axis 1
+        h2, l2 = ax2.get_legend_handles_labels()
+        ax1.legend(h1+h2, l1+l2, loc=1) #turn legend on with combined handles
+        
+        return fig
+    """
+    plt.show()
     """
     
+    def plot_aep(self, #AEP vs impacts
+                  dmg_ser = None,
+                  
+                  #labels
+                  y1lab='AEP',   xlab=None, 
+                  
+                  #format controls
+                  grid = True, 
+                  basev = 1, #base value for dividing damage values
+                  dfmt = None, #formatting of damage values 
+                  
+                  
+                  #figure parametrs
+                  figsize     = (6.5, 4), 
+                    
+                    #hatch pars
+                    hatch =  None,
+                    h_color = 'red',
+                    h_alpha = 0.1,
+                    
+                    xlrot = 45, #rotration for xlabels
+                  ):
+        
+
+        
+        #======================================================================
+        # defaults
+        #======================================================================
+        log = self.logger.getChild('plot_aep')
+        log.warning('depreciated!!')
+        if dmg_ser is None: dmg_ser = self.res_ser.copy()
+        if dfmt is None: dfmt = self.plot_fmt
+        if xlab is None: xlab = self.y1lab #pull from risk_plot notation
+
+        #======================================================================
+        # precheck
+        #======================================================================
+        assert isinstance(dmg_ser, pd.Series)
+        assert 'ead' in dmg_ser.index, 'dmg_ser missing ead index'
+        
+        log.info('on %i events \n    %s'%(len(dmg_ser), dmg_ser.to_dict()))
+        #======================================================================
+        # setup
+        #======================================================================
+        
+        import matplotlib
+        matplotlib.use('Qt5Agg') #sets the backend (case sensitive)
+        import matplotlib.pyplot as plt
+        
+        #set teh styles
+        plt.style.use('default')
+        
+        #font
+        matplotlib_font = {
+                'family' : 'serif',
+                'weight' : 'normal',
+                'size'   : 8}
+        
+        matplotlib.rc('font', **matplotlib_font)
+        matplotlib.rcParams['axes.titlesize'] = 10 #set the figure title size
+        
+        #spacing parameters
+        matplotlib.rcParams['figure.autolayout'] = False #use tight layout
+        
+        #======================================================================
+        # data manipulations
+        #======================================================================
+        aep_ser = dmg_ser.drop('ead')
+        ead_tot = dmg_ser['ead']
+                
+        #======================================================================
+        # labels
+        #======================================================================\
+        
+        val_str = 'annualized impacts = %s \nltail=\"%s\',  rtail=\'%s\''%(
+            dfmt.format(ead_tot/basev), self.ltail, self.rtail)
+        
+        title = '%s.%s Impact-%s plot on %i events'%(self.name,self.tag, y1lab, len(aep_ser))
+        
+        #======================================================================
+        # figure setup
+        #======================================================================
+        plt.close()
+        fig = plt.figure(figsize=figsize,
+                     tight_layout=False,
+                     constrained_layout = True,
+                     )
+
+        
+        #axis setup
+        ax1 = fig.add_subplot(111)
+        
+        #aep units
+        ax1.set_xlim(0, max(aep_ser)) #aep limits 
+        ax1.set_ylim(0, max(aep_ser.index)*1.1)
+        
+        """I think we need to use a label formatter instead
+        #ari units
+        ax2 = ax1.twiny()
+        ax2.set_xlabel(x2lab)
+        ax2.set_xlim(99999999, 1/max(aep_ser.index))"""
+        
+        # axis label setup
+        fig.suptitle(title)
+        ax1.set_ylabel(y1lab)
+
+        ax1.set_xlabel(xlab)
+        """
+        plt.close()
+        plt.show()
+        """
+        #======================================================================
+        # fill the plot
+        #======================================================================
+        #damage plot
+        xar,  yar = aep_ser.values.astype(np.float), aep_ser.index.values
+        pline1 = ax1.plot(xar,yar,
+                            label       = y1lab,
+                            color       = self.color,
+                            linestyle   = self.linestyle,
+                            linewidth   = self.linewidth,
+                            alpha       = self.alpha,
+                            marker      = self.marker,
+                            markersize  = self.markersize,
+                            fillstyle   = self.fillstyle, #marker fill style
+                            )
+        
+        #add a hatch
+
+        polys = ax1.fill_betweenx(yar.astype(np.float), x1=xar, x2=0, 
+                                color       = h_color, 
+                                alpha       = h_alpha,
+                                hatch       = hatch)
+        
+
+
+        #=======================================================================
+        # Add text string 'annot' to lower left of plot
+        #=======================================================================
+        xmin, xmax1 = ax1.get_xlim()
+        ymin, ymax1 = ax1.get_ylim()
+        
+        x_text = xmin + (xmax1 - xmin)*.5 # 1/10 to the right of the left ax1is
+        y_text = ymin + (ymax1 - ymin)*.2 #1/10 above the bottom ax1is
+        anno_obj = ax1.text(x_text, y_text, val_str)
+        
+        #=======================================================================
+        # format axis labels
+        #======================================================= ================
+        #damage values (xaxis)
+        old_tick_l = ax1.get_xticks() #get teh old labels
+         
+        # build the new ticks
+        l = [dfmt.format(value/basev) for value in old_tick_l]
+              
+        #apply the new labels
+        ax1.set_xticklabels(l, rotation=xlrot)
+
+        #=======================================================================
+        # #ARI (xaxis for ax1)
+        # ax1.get_xaxis().set_major_formatter(
+        #         matplotlib.ticker.FuncFormatter(lambda x, p: format(int(x), ',')))
+        #=======================================================================
+        
+        #=======================================================================
+        # post formatting
+        #=======================================================================
+        if grid: 
+            ax1.grid()
+        
+
+        #legend
+        h1, l1 = ax1.get_legend_handles_labels() #pull legend handles from axis 1
+
+        ax1.legend(h1, l1, loc=2) #turn legend on with combined handles
+        
+        return fig
+    """
+    plt.show()
+    """
+    
+    def fmt_dmg_plot(self,#formatting damages for plotting
+                     dmg_ser_raw): 
+        
+        #get ead
+        dmg_ser = dmg_ser_raw.copy()
+        ead_tot = dmg_ser['ead']
+        del dmg_ser['ead'] #remove it from plotter values
+        
+        
+        #get damage series to plot
+        ar = np.array([dmg_ser.index, dmg_ser.values]) #convert to array
+        
+        #invert aep (w/ zero handling)
+        ar[0] = 1/np.where(ar[0]==0, #replaced based on zero value
+                           sorted(ar[0])[1]/10, #dummy value for zero (take the second smallest value and divide by 10)
+                           ar[0]) 
+        
+        dmg_ser1 = pd.Series(ar[1], index=ar[0], dtype=float) #back into series
+        dmg_ser1.index = dmg_ser1.index.astype(int) #format it
+        
+        return ead_tot, dmg_ser1
+        
+    
+   
+
+    #==========================================================================
+    # VALIDATORS-----------
+    #==========================================================================
+    def check_attrimat(self, #check the logic of the attrimat
+                       atr_dxcol=None,
+                       logger=None,
+
+                       ):
+        """
+        attrimat rows should always sum to 1.0 on lvl0
+        """
+        #=======================================================================
+        # defaults
+        #=======================================================================
+        if atr_dxcol is None: atr_dxcol=self.att_df
+        
+        #mdex = atr_dxcol.columns
+        #=======================================================================
+        # #determine what level to perofrm sum check on
+        # sumLvl = atr_dxcol.columns.nlevels -2 #should always be the last rank/level
+        #=======================================================================
+        
+        #sum each of the grpColns nested under the rEventName        
+        bool_df = atr_dxcol.sum(axis=1, level=0, skipna=False).round(self.prec)==1.0
+        
+        #=======================================================================
+        # #drop all but the top level. identify null locations
+        # nbool_df = atr_dxcol.droplevel(
+        #     level=list(range(1, mdex.nlevels)), axis=1
+        #     ).notna()
+        # 
+        # #check the failures line up with the nulls
+        # bool2_df = psumBool_df==nbool_df.loc[:, ~nbool_df.columns.duplicated(keep='first')]
+        #=======================================================================
+        
+        """
+
+        view(atr_dxcol.sum(axis=1, level=0, skipna=False))
+        view(bool_df)
+        view(atr_dxcol)
+        """
+        if not bool_df.all().all():
+            raise Error('%i (of %i) attribute matrix entries failed sum=1 test'%(
+                np.invert(bool_df).sum().sum(), bool_df.size))
+            
+        return True
+            
+        
+    
+    def check_monot(self,
+                     df_raw, #event:asset like data. expectes columns as aep 
+                     split_key = False, #optional key to split hazard columns with (for fail/noFail sets)
+                     aep_ser=None, event_probs = 'aep', #optional kwargs for column conversion
+                     logger=None
+                     ):
+        """
+        if damages are equal the warning will be thrown
+        
+        todo: store this as an output
+        """
+        
+        
+        #======================================================================
+        # defaults
+        #======================================================================
+        
+        if logger is None: logger=self.logger
+        if split_key is None: split_key = self.split_key
+        log = logger.getChild('check_monot')
+        
+        #======================================================================
+        # worker func
+        #======================================================================
+        def chk_func(df_raw, log):
+        
+            #======================================================================
+            # convresions
+            #======================================================================
+            if not aep_ser is None:
+                df, d = self._conv_expo_aep(df_raw, aep_ser, event_probs=event_probs, logger=log)
+            else:
+                df = df_raw.copy()
+            
+            log.debug('on %s w/ cols: \n    %s'%(str(df.shape), df.columns.tolist()))
+            #======================================================================
+            # prechecks
+            #======================================================================
+            
+            assert np.issubdtype(df.columns.dtype, np.number)
+            """should be ok
+            assert np.all(df.notna()), 'got some nulls'"""
+            assert df.columns.is_monotonic_increasing #extreme to likely
+            assert df.columns.max() <1
+            
+            #======================================================================
+            # clean
+            #======================================================================
+            if df.isna().any().any():
+                log.warning('replacing %i nulls w/ zeros for check'%df.isna().sum().sum())
+                df = df.fillna(0).copy()
+                
+            #======================================================================
+            # check
+            #======================================================================
+            """
+                    #apply the ead func
+            df.loc[boolidx, 'ead'] = df.loc[boolidx, :].apply(
+                self._get_ev, axis=1, dx=dx)
+            """
+            def chk_func(ser):
+                return ser.is_monotonic_decreasing
+        
+            #check for damage monotonicity (should go from left BIG/extreme to right small/likely
+            """
+            view(df)
+            view(df[boolidx])
+            """
+            #get offenders (from 
+            boolidx = np.logical_and(
+                ~df.apply(chk_func, axis=1), #NOT going left big to righ textreme
+                df.nunique(axis=1) > 1, #only one value per row
+                )
+    
+            if boolidx.any():
+                with pd.option_context(
+                                'display.max_rows', None, 
+                               'display.max_columns', None,
+                               #'display.height',1000,
+                               'display.width',1000):
+                        
+                    log.debug('\n%s'%df.loc[boolidx, :])
+                    log.debug('\n%s'%df[boolidx].index.tolist())
+                    log.warning(' %i (of %i)  assets have non-monotonic-increasing damages. see logger'%(
+                        boolidx.sum(), len(boolidx)))
+                
+                return False
+            else:
+                log.debug('all %i passed'%len(df))
+                return True
+        
+        #======================================================================
+        # splitting
+        #======================================================================
+        if not split_key == False:
+            boolcol = df_raw.columns.str.contains(split_key)
+            
+            if not boolcol.any():
+                raise Error('failed to split events by \"%s\''%split_key)
+            
+            res1 = chk_func(df_raw.loc[:,boolcol], log.getChild(split_key))
+            res2 = chk_func(df_raw.loc[:,~boolcol], log.getChild('no%s'%split_key))
+            
+            result = res1 and res2
+            
+        else:
+            result= chk_func(df_raw, log)
+            
+        return result
+    
+    #===========================================================================
+    # OUTPUTS---------
+    #===========================================================================
+    def output_attr(self, #short cut for saving the expanded reuslts
+                    dtag=None,
+                    ofn = None,
+                    upd_cf= True,
+                    logger=None,
+                    ):
+        assert self.attriMode
+        #=======================================================================
+        # defaults
+        #=======================================================================
+        if ofn is None:
+            ofn = 'attr%02d_%s'%(self.att_df.columns.nlevels, self.name)
+        if dtag is None: dtag = self.attrdtag_out
+            
+        out_fp = self.output_df(self.att_df, ofn, logger=logger)
+        
+        #update the control file
+        if upd_cf:
+            self.update_cf(
+                    {
+                    'results_fps':(
+                        {dtag:out_fp}, 
+                        '#\'%s\' file path set from output_attr at %s'%(
+                            dtag, datetime.datetime.now().strftime('%Y-%m-%d %H.%M.%S')),
+                        ),
+                     },
+                    cf_fp = self.cf_fp
+                )
+        return out_fp
+    
+    def output_etype(self,
+                     df = None,
+                     dtag='eventypes',
+                     ofn=None,
+                     upd_cf=True,
+                     logger=None):
+        
+        
+        
+        #=======================================================================
+        # defaults
+        #=======================================================================
+        if df is None: df = self.eventType_df
+        if ofn is None:
+            ofn = '%s_%s'%(dtag, self.name)
+
+            
+        out_fp = self.output_df(df, ofn, logger=logger, write_index=False)
+        
+        #update the control file
+        if upd_cf:
+            self.update_cf(
+                    {
+                    'results_fps':(
+                        {dtag:out_fp}, 
+                        '#\'%s\' file path set from output_etype at %s'%(
+                            dtag, datetime.datetime.now().strftime('%Y-%m-%d %H.%M.%S')),
+                        ),
+                     },
+                    cf_fp = self.cf_fp
+                )
+        return out_fp
+            
+
+
     
     
-    print('finished')
     
-    
-    
-    
+#===============================================================================
+# def get_scenario_set(n):
+#     
+#     which = np.array(list(itertools.combinations(range(10), 2)))
+#     grid = np.zeros((len(which), 10), dtype="int8")
+#     
+#     # Magic
+#     grid[np.arange(len(which))[None].T, which] = 1
+#     
+#     
+#     return grid
+#===============================================================================
     
     
     

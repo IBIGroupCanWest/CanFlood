@@ -17,11 +17,12 @@ helper functions w/o qgis api
 # imports------------
 #==============================================================================
 #python
-import os, configparser, logging
+import os, configparser, logging, re
 import pandas as pd
+pd.set_option('display.max_rows',10)
 import numpy as np
 
-mod_logger = logging.getLogger('hp') #creates a child logger of the root
+
 
 #==============================================================================
 # custom
@@ -34,7 +35,7 @@ if __name__ =="__main__":
     
 #plugin runs
 else:
-    mod_logger = logging.getLogger('common') #get the root logger
+    mod_logger = logging.getLogger('basic') #get the root logger
 
 from hlpr.exceptions import QError as Error
 
@@ -48,13 +49,29 @@ class ComWrkr(object): #common methods for all classes
     
     #mandatory keys for curves
     crv_keys = ('tag', 'exposure')
+    invalid_cids = ['fid', 'ogc_fid']
     
-    def __init__(self, tag='session', 
+    
+    #[plotting]
+    """these can also be loaded from a control file"""
+    color = 'black'
+    linestyle = 'dashdot'
+    linewidth = 2.0
+    alpha =     0.75        #0=transparent 1=opaque
+    marker =    'o'
+    markersize = 4.0
+    fillstyle = 'none'    #marker fill style
+    
+    
+    def __init__(self, 
+                 tag='session', 
                  cid='xid', #default used by inventory constructors
                  cf_fp='',
+
                  overwrite=True, 
                  out_dir=None, 
                  logger=mod_logger,
+
                  prec = 4,
                  
                 feedback = None, #feed back object
@@ -63,6 +80,13 @@ class ComWrkr(object): #common methods for all classes
                  ):
         """
         Dialogs don't call this
+        
+        #=======================================================================
+        # LOGGING
+        #=======================================================================
+        for standalone runs:
+            pass mod_logger=logr.basic_logger() for this in the __main__ init call 
+
         
         """
         #======================================================================
@@ -76,6 +100,7 @@ class ComWrkr(object): #common methods for all classes
             os.makedirs(out_dir)
             self.logger.info('created requested output directory: \n    %s'%out_dir)
 
+        self.data_d = dict() #dictionary for loaded data sets
         #======================================================================
         # attach
         #======================================================================
@@ -194,7 +219,8 @@ class ComWrkr(object): #common methods for all classes
         
         
     def update_cf(self, #update one parameter  control file 
-                  new_pars_d, #new paraemeters {section : {valnm : value }}
+                  new_pars_d, #new paraemeters 
+                    # {section : ({valnm : value } OR string (for notes)})
                   cf_fp = None):
         
         log = self.logger.getChild('update_cf')
@@ -222,7 +248,7 @@ class ComWrkr(object): #common methods for all classes
                         
                         pars.set(section, valnm, value)
                         
-                #single values    
+                #single values(for notes mostly)
                 elif isinstance(subval, str):
                     pars.set(section, subval)
                     
@@ -246,13 +272,15 @@ class ComWrkr(object): #common methods for all classes
                       out_dir = None,
                       overwrite=None,
                       write_index=True,
+                      logger=None,
             ):
         #======================================================================
         # defaults
         #======================================================================
         if out_dir is None: out_dir = self.out_dir
         if overwrite is None: overwrite = self.overwrite
-        log = self.logger.getChild('output')
+        if logger is None: logger=self.logger
+        log = logger.getChild('output_df')
         
         #======================================================================
         # prechecks
@@ -709,6 +737,13 @@ def force_open_dir(folder_path_raw, logger=mod_logger): #force explorer to open 
     except:
         logger.error('unable to open directory: \n %s'%dir)
         return False
+    
+    
+def get_valid_filename(s):
+    s = str(s).strip().replace(' ', '_')
+    s = re.sub(r'(?u)[^-\w.]', '', s)
+    s = re.sub(':','-', s)
+    return s
     
     
 if __name__ =="__main__": 
