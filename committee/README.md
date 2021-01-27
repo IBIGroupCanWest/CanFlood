@@ -19,7 +19,7 @@ Here is a [link to the presentation](https://github.com/IBIGroupCanWest/CanFlood
   
 4) Complete [feedback form](https://docs.google.com/forms/d/e/1FAIpQLSegbTw9G5BURtstqhOdsuGtfbGrMEByYmu31ctImSxgOx4EeA/viewform?usp=sf_link)
 
-### We will reconvene on Jan XXX for meeting 2 to discuss the results of Task 1
+### We will reconvene on Jan 28 for meeting 2 to discuss the results of Task 1
 
 
 *email bryant.seth@gmail.com to request access
